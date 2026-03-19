@@ -127,4 +127,16 @@ def RegOfVecToMem : Pass<"seq-reg-of-vec-to-mem", "hw::HWModuleOp"> {
   }];
 }
 
+
+def UndefinedMemoryBehavior : Pass<"undefined-memory-behavior", "hw::HWModuleOp">{
+    let summary = "Disambiguates undefined memory behavior";
+    let description = [{
+         Adds sources of randomness to model the various "undefined behaviors" of firrtl memory.
+           - Write/Write conflict: leads to arbitrary value written to write address
+           - Out-of-bounds write: assertion failure (disabled by default)
+           - Out-Of-bounds read: leads to arbitrary value being read
+           - Read w/ en=0: leads to arbitrary value being read
+           - Read/Write conflict: leads to arbitrary value being read
+    }];
+}
 #endif // CIRCT_DIALECT_SEQ_SEQPASSES
