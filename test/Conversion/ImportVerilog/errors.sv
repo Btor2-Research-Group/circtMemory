@@ -193,6 +193,66 @@ module Foo;
 endmodule
 
 // -----
+module Foo;
+  typedef enum { A, B, C } e;
+  e val;
+  initial begin
+    // expected-error @below {{unsupported system call `next`}}
+    val = val.next();
+  end
+endmodule
+
+// -----
+module Foo;
+  typedef enum { A, B, C } e;
+  e val;
+  initial begin
+    // expected-error @below {{unsupported system call `prev`}}
+    val = val.prev();
+  end
+endmodule
+
+// -----
+module Foo;
+  int inp[];
+  int tmp[];
+  initial begin
+    // expected-error @below {{unsupported system call `$size`}}
+    tmp = new[$size(inp)];
+  end
+endmodule
+
+// -----
+// Cross-module hierarchical references can produce null port values that must
+// not crash during instance creation. This is an error in the hierarchical
+// reference resolution code that actually needs fixing. This test guards
+// against a regression to this being a crash.
+module HierRefTop(input i, output o);
+  HierRefA A();
+  // expected-error @below {{unsupported port}}
+  HierRefB B();
+  assign A.i = i;
+  assign o = B.o;
+endmodule
+module HierRefA;
+  wire i, y;
+  assign B.x = !i;
+  assign y = !B.y;
+endmodule
+module HierRefB;
+  wire x, y, o;
+  assign y = x, o = A.y;
+endmodule
+
+// -----
+module Foo;
+  reg i;
+  wire o;
+  // expected-error @below {{unsupported delay with rise/fall/turn-off}}
+  assign #(1, 2) o = i;
+endmodule
+
+// -----
 function Foo;
   logic [1:0] a;
   // expected-error @below {{unsupported system call `$fwrite`}}
