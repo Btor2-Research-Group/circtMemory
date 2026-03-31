@@ -2657,12 +2657,6 @@ void InstanceOp::setAllPortAnnotations(ArrayRef<Attribute> annotations) {
                    ArrayAttr::get(getContext(), annotations));
 }
 
-Attribute InstanceOp::getPortDomain(unsigned portIdx) {
-  assert(portIdx < getNumResults() &&
-         "index should be smaller than result number");
-  return getDomainInfo()[portIdx];
-}
-
 FInstanceLike InstanceOp::cloneWithInsertedPorts(
     ArrayRef<std::pair<unsigned, PortInfo>> insertions) {
   auto *context = getContext();

@@ -345,9 +345,6 @@ def FInstanceLike : OpInterface<"FInstanceLike", [
     InterfaceMethod<"Get the port names attribute",
       "ArrayAttr", "getPortNamesAttr">,
 
-    InterfaceMethod<"Get the port names",
-      "ArrayRef<Attribute>", "getPortNames">,
-
     //===------------------------------------------------------------------===//
     // Inner Symbol
     //===------------------------------------------------------------------===//
@@ -390,6 +387,13 @@ def FInstanceLike : OpInterface<"FInstanceLike", [
       /*defaultImplementation=*/[{
         $_op.setDomainInfo(domainInfo);
       }]>,
+
+    InterfaceMethod<"Get domain information attribute",
+      "Attribute", "getPortDomain", (ins "size_t":$portIndex), [{}],
+      /*defaultImplementation=*/[{
+        return $_op.getDomainInfo()[portIndex];
+      }]>,
+
 
     //===------------------------------------------------------------------===//
     // Layer Information

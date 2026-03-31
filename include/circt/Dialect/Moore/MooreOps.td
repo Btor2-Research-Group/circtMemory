@@ -21,6 +21,7 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "mlir/Interfaces/MemorySlotInterfaces.td"
 include "mlir/Interfaces/CallInterfaces.td"
+include "mlir/Interfaces/FunctionInterfaces.td"
 
 // Base class for the operations in this dialect.
 class MooreOp<string mnemonic, list<Trait> traits = []> :
@@ -194,9 +195,9 @@ def ProcedureOp : MooreOp<"procedure", [
 }
 
 def ReturnOp : MooreOp<"return", [
-  Pure, Terminator, HasParent<"ProcedureOp">
+  Pure, Terminator, ParentOneOf<["ProcedureOp", "CoroutineOp"]>
 ]> {
-  let summary = "Return from a procedure";
+  let summary = "Return from a procedure or coroutine";
   let assemblyFormat = [{ attr-dict }];
 }
 
@@ -210,6 +211,154 @@ def UnreachableOp : MooreOp<"unreachable", [Terminator]> {
     probably crash the process with a useful error message.
   }];
   let assemblyFormat = "attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Coroutines
+//===----------------------------------------------------------------------===//
+
+def CoroutineOp : MooreOp<"coroutine", [
+  IsolatedFromAbove,
+  FunctionOpInterface,
+  Symbol,
+  RegionKindInterface,
+  RecursiveMemoryEffects,
+]> {
+  let summary = "Define a coroutine";
+  let description = [{
+    The `moore.coroutine` op represents a SystemVerilog task. Tasks differ from
+    functions in that they can suspend execution via timing controls such as
+    `@(posedge clk)` or `#10`. This makes them coroutine-like: a call to a
+    coroutine suspends the calling process until the coroutine returns.
+
+    See IEEE 1800-2017 § 13.3 "Tasks".
+
+    Coroutines are `IsolatedFromAbove` and capture any external variables
+    explicitly as additional arguments, just like `func.func`. Any signals or
+    variables from the enclosing module are passed as reference arguments.
+
+    Example:
+    ```mlir
+    moore.coroutine private @waitForClk(%clk: !moore.ref<l1>) {
+      moore.wait_event {
+        %0 = moore.read %clk : <l1>
+        moore.detect_event posedge %0 : l1
+      }
+      moore.return
+    }
+    ```
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    TypeAttrOf<FunctionType>:$function_type,
+    OptionalAttr<StrAttr>:$sym_visibility,
+    OptionalAttr<DictArrayAttr>:$arg_attrs,
+    OptionalAttr<DictArrayAttr>:$res_attrs
+  );
+  let results = (outs);
+  let regions = (region MinSizedRegion<1>:$body);
+
+  let hasCustomAssemblyFormat = 1;
+
+  let builders = [
+    OpBuilder<(ins "mlir::StringAttr":$sym_name,
+                   "mlir::TypeAttr":$function_type), [{
+      build($_builder, $_state, sym_name, function_type,
+            /*sym_visibility=*/mlir::StringAttr(),
+            /*arg_attrs=*/nullptr, /*res_attrs=*/nullptr);
+    }]>,
+    OpBuilder<(ins "mlir::StringRef":$sym_name,
+                   "mlir::FunctionType":$function_type), [{
+      build($_builder, $_state,
+            $_builder.getStringAttr(sym_name),
+            mlir::TypeAttr::get(function_type),
+            /*sym_visibility=*/mlir::StringAttr(),
+            /*arg_attrs=*/nullptr, /*res_attrs=*/nullptr);
+    }]>,
+  ];
+
+  let extraClassDeclaration = [{
+    static mlir::RegionKind getRegionKind(unsigned index) {
+      return mlir::RegionKind::SSACFG;
+    }
+
+    /// Returns the argument types of this coroutine.
+    mlir::ArrayRef<mlir::Type> getArgumentTypes() {
+      return getFunctionType().getInputs();
+    }
+
+    /// Returns the result types of this coroutine.
+    mlir::ArrayRef<mlir::Type> getResultTypes() {
+      return getFunctionType().getResults();
+    }
+
+    //===------------------------------------------------------------------===//
+    // CallableOpInterface
+    //===------------------------------------------------------------------===//
+
+    mlir::Region *getCallableRegion() { return &getBody(); }
+  }];
+}
+
+def CallCoroutineOp : MooreOp<"call_coroutine", [
+  CallOpInterface,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>,
+]> {
+  let summary = "Call a coroutine";
+  let description = [{
+    The `moore.call_coroutine` op calls a `moore.coroutine`, which represents a
+    SystemVerilog task call. The calling process suspends until the coroutine
+    returns. This is only valid inside a procedure or another coroutine.
+
+    Example:
+    ```mlir
+    moore.call_coroutine @waitForClk(%clk) : (!moore.ref<l1>) -> ()
+    ```
+  }];
+
+  let arguments = (ins FlatSymbolRefAttr:$callee, Variadic<AnyType>:$operands);
+  let results = (outs Variadic<AnyType>);
+
+  let assemblyFormat = [{
+    $callee `(` $operands `)` attr-dict `:` functional-type(operands, results)
+  }];
+
+  let builders = [
+    OpBuilder<(ins "CoroutineOp":$coroutine,
+                   CArg<"mlir::ValueRange", "{}">:$operands), [{
+      build($_builder, $_state, coroutine.getFunctionType().getResults(),
+            mlir::SymbolRefAttr::get(coroutine), operands);
+    }]>,
+  ];
+
+  let extraClassDeclaration = [{
+    operand_range getArgOperands() {
+      return getOperands();
+    }
+    MutableOperandRange getArgOperandsMutable() {
+      return getOperandsMutable();
+    }
+
+    mlir::CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<mlir::SymbolRefAttr>("callee");
+    }
+
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getCalleeAttrName(),
+                       llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+
+    /// CallOpInterface requires ArgAndResultAttrsOpInterface, which needs
+    /// methods to get/set per-argument and per-result attributes. Call sites
+    /// don't carry these attributes, so we stub them out as no-ops.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -629,6 +778,7 @@ def ConstantOp : MooreOp<"constant", [Pure, ConstantLike]> {
     OpBuilder<(ins "IntType":$type, "const APInt &":$value)>,
     OpBuilder<(
       ins "IntType":$type, "int64_t":$value, CArg<"bool", "true">:$isSigned)>,
+    OpBuilder<(ins "Domain":$domain, "bool":$value)>,
   ];
 }
 
@@ -2769,58 +2919,32 @@ def BitstoshortrealBIOp : Builtin<"bitstoshortreal"> {
 // True-Random and Pseudo-Random Generators
 //===----------------------------------------------------------------------===//
 
-def RandomBIOp : Builtin<"random"> {
-  let summary = "Generate a true random signed integer (optionally seeded)";
+def UrandomRangeBIOp : Builtin<"urandom_range"> {
+  let summary = "Generate a pseudo-random integer within a range";
   let description = [{
-    Corresponds to the `$random` system function. Returns a 32-bit
-    true random integer. The seed is optional; when provided, it initializes
-    the generator. If not provided, treat it as 0 in semantics/lowering.
+    Returns a pseudo-random 32-bit integer in the range [minval, maxval]. This
+    is the unified primitive for all SystemVerilog random number generation:
 
-    `$random` is largely considered to be deprecated since it leads to
-    non-reproducible simulation results. Consider using `$urandom` instead.
+    - `$random` maps to `urandom_range(0, 2^31-1)` (signedness is a
+      reinterpretation of the result, not a property of the random value)
+    - `$urandom` maps to `urandom_range(0, 2^32-1)`
+    - `$urandom_range(max)` maps to `urandom_range(0, max)`
+    - `$urandom_range(max, min)` maps to `urandom_range(min, max)`
 
-    See IEEE 1800-2023 § 20.14 "Probablistic distribution functions".
-  }];
+    The optional `seed` is an inout reference to a 32-bit integer that the
+    random number generator reads and mutates. When not provided, the generator
+    uses an internal seed.
 
-  // Optional positional attribute for the seed
-  let arguments = (ins Optional<TwoValuedI32>:$seed);
-  let results = (outs TwoValuedI32:$result);
-  let assemblyFormat = "($seed^)? attr-dict";
-}
-
-def UrandomBIOp : Builtin<"urandom"> {
-  let summary = "Generate a pseudo-random unsigned integer (optionally seeded)";
-  let description = [{
-    Corresponds to the `$urandom` system function. Returns a 32-bit
-    pseudo-random integer. The seed is optional; when provided, it initializes
-    the generator. If not provided, treat it as 0 in semantics/lowering.
-
-    See IEEE 1800-2023 § 18.13 "Random number system functions and methods".
-  }];
-
-  // Optional positional attribute for the seed
-  let arguments = (ins Optional<TwoValuedI32>:$seed);
-  let results = (outs TwoValuedI32:$result);
-  let assemblyFormat = "($seed^)? attr-dict";
-}
-
-def UrandomrangeBIOp : Builtin<"urandom_range"> {
-  let summary = "Generate a pseudo-random unsigned integer within provided range";
-  let description = [{
-    Corresponds to the `urandom_range()` system function. Returns a 32-bit 
-    pseudo-random integer. The minimum value is optional; when not provided, it 
-    is treated as 0. If the minimum value is provided and larger than the maximum 
-    value, the minimum value is treated as the maximum, aand vice versa.
-
-    See IEEE 1800-2023 $ 18.13.2 "$urandom_range()".
+    See IEEE 1800-2017 § 18.13 "Random number system functions and methods".
   }];
 
   let arguments = (ins
+    TwoValuedI32:$minval,
     TwoValuedI32:$maxval,
-    Optional<TwoValuedI32>:$minval
+    Optional<TwoValuedI32RefType>:$seed
   );
   let results = (outs TwoValuedI32:$result);
-  let assemblyFormat = "$maxval ($minval^)? attr-dict";
+  let assemblyFormat = "$minval `,` $maxval (`,` $seed^)? attr-dict";
 }
 
 //===----------------------------------------------------------------------===//

@@ -178,6 +178,38 @@ struct ExprVisitor {
     return context.convertRvalueExpression(expr);
   }
 
+  /// Materialize the rvalue of a symbol, regardless of whether it is backed by
+  /// a local reference, global variable, or class property.
+  Value materializeSymbolRvalue(const slang::ast::ValueSymbol &sym) {
+    if (auto value = context.valueSymbols.lookup(&sym)) {
+      if (isa<moore::RefType>(value.getType())) {
+        auto readOp = moore::ReadOp::create(builder, loc, value);
+        if (context.rvalueReadCallback)
+          context.rvalueReadCallback(readOp);
+        return readOp.getResult();
+      }
+      return value;
+    }
+
+    if (auto globalOp = context.globalVariables.lookup(&sym)) {
+      auto ref = moore::GetGlobalVariableOp::create(builder, loc, globalOp);
+      auto readOp = moore::ReadOp::create(builder, loc, ref);
+      if (context.rvalueReadCallback)
+        context.rvalueReadCallback(readOp);
+      return readOp.getResult();
+    }
+
+    if (auto *const property = sym.as_if<slang::ast::ClassPropertySymbol>()) {
+      auto fieldRef = visitClassProperty(context, *property);
+      auto readOp = moore::ReadOp::create(builder, loc, fieldRef);
+      if (context.rvalueReadCallback)
+        context.rvalueReadCallback(readOp);
+      return readOp.getResult();
+    }
+
+    return {};
+  }
+
   Value visit(const slang::ast::NewArrayExpression &expr) {
     Type type = context.convertType(*expr.type);
 
@@ -638,6 +670,32 @@ struct ExprVisitor {
     auto *valueType = expr.value().type.get();
     auto memberName = builder.getStringAttr(expr.member.name);
 
+    // Handle virtual interfaces. We represent virtual interface handles as a
+    // Moore struct containing references to interface members. Member access
+    // returns the stored reference directly (for lvalues) or reads it (for
+    // rvalues).
+    if (valueType->isVirtualInterface()) {
+      auto memberType = dyn_cast<moore::UnpackedType>(type);
+      if (!memberType) {
+        mlir::emitError(loc)
+            << "unsupported virtual interface member type: " << type;
+        return {};
+      }
+      auto resultRefType = moore::RefType::get(memberType);
+
+      // Always use the rvalue of the base handle to avoid creating
+      // ref<ref<T>> for lvalue member access.
+      Value base = context.convertRvalueExpression(expr.value());
+      if (!base)
+        return {};
+
+      auto memberRef = moore::StructExtractOp::create(
+          builder, loc, resultRefType, memberName, base);
+      if (isLvalue)
+        return memberRef;
+      return moore::ReadOp::create(builder, loc, memberRef);
+    }
+
     // Handle structs.
     if (valueType->isStruct()) {
       auto resultType =
@@ -784,6 +842,43 @@ struct RvalueExprVisitor : public ExprVisitor {
       return moore::ReadOp::create(builder, loc, fieldRef).getResult();
     }
 
+    // Slang may resolve `vif.member` accesses (with `vif` being a virtual
+    // interface handle) directly to a NamedValueExpression for `member`.
+    // Reconstruct the virtual interface access by consulting the mapping
+    // populated at declaration sites.
+    if (auto access = context.virtualIfaceMembers.lookup(&expr.symbol);
+        access.base) {
+      auto type = context.convertType(*expr.type);
+      if (!type)
+        return {};
+      auto memberType = dyn_cast<moore::UnpackedType>(type);
+      if (!memberType) {
+        mlir::emitError(loc)
+            << "unsupported virtual interface member type: " << type;
+        return {};
+      }
+
+      Value base = materializeSymbolRvalue(*access.base);
+      if (!base) {
+        auto d = mlir::emitError(loc, "unknown name `")
+                 << access.base->name << "`";
+        d.attachNote(context.convertLocation(access.base->location))
+            << "no rvalue generated for virtual interface base";
+        return {};
+      }
+
+      auto fieldName = access.fieldName
+                           ? access.fieldName
+                           : builder.getStringAttr(expr.symbol.name);
+      auto memberRefType = moore::RefType::get(memberType);
+      auto memberRef = moore::StructExtractOp::create(
+          builder, loc, memberRefType, fieldName, base);
+      auto readOp = moore::ReadOp::create(builder, loc, memberRef);
+      if (context.rvalueReadCallback)
+        context.rvalueReadCallback(readOp);
+      return readOp.getResult();
+    }
+
     // Try to materialize constant values directly.
     auto constant = context.evaluateConstant(expr);
     if (auto value = context.materializeConstant(constant, *expr.type, loc))
@@ -816,6 +911,22 @@ struct RvalueExprVisitor : public ExprVisitor {
              << expr.symbol.name << "`";
     d.attachNote(hierLoc) << "no rvalue generated for "
                           << slang::ast::toString(expr.symbol.kind);
+    return {};
+  }
+
+  // Handle arbitrary symbol references. Slang uses this expression to represent
+  // "real" interface instances in virtual interface assignments.
+  Value visit(const slang::ast::ArbitrarySymbolExpression &expr) {
+    const auto &canonTy = expr.type->getCanonicalType();
+    if (const auto *vi = canonTy.as_if<slang::ast::VirtualInterfaceType>()) {
+      auto value = context.materializeVirtualInterfaceValue(*vi, loc);
+      if (failed(value))
+        return {};
+      return *value;
+    }
+
+    mlir::emitError(loc) << "unsupported arbitrary symbol expression of type "
+                         << expr.type->toString();
     return {};
   }
 
@@ -1620,7 +1731,7 @@ struct RvalueExprVisitor : public ExprVisitor {
                   SmallVector<Type> &resultTypes) {
 
     // Get the expected receiver type from the lowered method
-    auto funcTy = lowering->op.getFunctionType();
+    auto funcTy = cast<FunctionType>(lowering->op.getFunctionType());
     auto expected0 = funcTy.getInput(0);
     auto expectedHdlTy = cast<moore::ClassHandleType>(expected0);
 
@@ -1639,8 +1750,10 @@ struct RvalueExprVisitor : public ExprVisitor {
         (subroutine->flags & slang::ast::MethodFlags::Virtual) != 0;
 
     if (!isVirtual) {
-      auto calleeSym = lowering->op.getSymName();
-      // Direct (non-virtual) call -> moore.class.call
+      auto calleeSym = lowering->op.getName();
+      if (lowering->isCoroutine())
+        return moore::CallCoroutineOp::create(builder, loc, resultTypes,
+                                              calleeSym, explicitArguments);
       return mlir::func::CallOp::create(builder, loc, resultTypes, calleeSym,
                                         explicitArguments);
     }
@@ -1748,8 +1861,8 @@ struct RvalueExprVisitor : public ExprVisitor {
 
     // Determine result types from the declared/converted func op.
     SmallVector<Type> resultTypes(
-        lowering->op.getFunctionType().getResults().begin(),
-        lowering->op.getFunctionType().getResults().end());
+        cast<FunctionType>(lowering->op.getFunctionType()).getResults().begin(),
+        cast<FunctionType>(lowering->op.getFunctionType()).getResults().end());
 
     mlir::CallOpInterface callOp;
     if (isMethod) {
@@ -1758,10 +1871,15 @@ struct RvalueExprVisitor : public ExprVisitor {
       auto [thisRef, tyHandle] = getMethodReceiverTypeHandle(expr);
       callOp = buildMethodCall(subroutine, lowering, tyHandle, thisRef,
                                arguments, resultTypes);
+    } else if (lowering->isCoroutine()) {
+      // Free task -> moore.call_coroutine
+      auto coroutine = cast<moore::CoroutineOp>(lowering->op);
+      callOp =
+          moore::CallCoroutineOp::create(builder, loc, coroutine, arguments);
     } else {
       // Free function -> func.call
-      callOp =
-          mlir::func::CallOp::create(builder, loc, lowering->op, arguments);
+      auto funcOp = cast<mlir::func::FuncOp>(lowering->op);
+      callOp = mlir::func::CallOp::create(builder, loc, funcOp, arguments);
     }
 
     auto result = resultTypes.size() > 0 ? callOp->getOpResult(0) : Value{};
@@ -2208,6 +2326,35 @@ struct LvalueExprVisitor : public ExprVisitor {
     if (auto *const property =
             expr.symbol.as_if<slang::ast::ClassPropertySymbol>()) {
       return visitClassProperty(context, *property);
+    }
+
+    if (auto access = context.virtualIfaceMembers.lookup(&expr.symbol);
+        access.base) {
+      auto type = context.convertType(*expr.type);
+      if (!type)
+        return {};
+      auto memberType = dyn_cast<moore::UnpackedType>(type);
+      if (!memberType) {
+        mlir::emitError(loc)
+            << "unsupported virtual interface member type: " << type;
+        return {};
+      }
+
+      Value base = materializeSymbolRvalue(*access.base);
+      if (!base) {
+        auto d = mlir::emitError(loc, "unknown name `")
+                 << access.base->name << "`";
+        d.attachNote(context.convertLocation(access.base->location))
+            << "no rvalue generated for virtual interface base";
+        return {};
+      }
+
+      auto fieldName = access.fieldName
+                           ? access.fieldName
+                           : builder.getStringAttr(expr.symbol.name);
+      auto memberRefType = moore::RefType::get(memberType);
+      return moore::StructExtractOp::create(builder, loc, memberRefType,
+                                            fieldName, base);
     }
 
     auto d = mlir::emitError(loc, "unknown name `") << expr.symbol.name << "`";
@@ -2840,48 +2987,37 @@ Value Context::convertSystemCall(
   // Random Number System Functions
   //===--------------------------------------------------------------------===//
 
-  if (nameId == ksn::URandom) {
-    if (numArgs == 0)
-      return moore::UrandomBIOp::create(builder, loc, nullptr);
+  // $urandom, $random, and $urandom_range all map to a single
+  // moore.builtin.urandom_range primitive with (minval, maxval, seed).
+  if (nameId == ksn::URandom || nameId == ksn::Random) {
+    auto i32Ty = moore::IntType::getInt(builder.getContext(), 32);
+    auto minval = moore::ConstantOp::create(builder, loc, i32Ty, 0);
+    auto maxval =
+        moore::ConstantOp::create(builder, loc, i32Ty, APInt::getAllOnes(32));
+    Value seed;
     if (numArgs == 1) {
-      auto seed = convertRvalueExpression(*args[0]);
+      seed = convertLvalueExpression(*args[0]);
       if (!seed)
         return {};
-      return moore::UrandomBIOp::create(builder, loc, seed);
     }
-    // Slang already checks the arity of `$urandom`.
-    assert(false && "`$urandom` takes 0 or 1 arguments");
-    return {};
-  }
-
-  if (nameId == ksn::Random) {
-    if (numArgs == 0)
-      return moore::RandomBIOp::create(builder, loc, nullptr);
-    if (numArgs == 1) {
-      auto seed = convertRvalueExpression(*args[0]);
-      if (!seed)
-        return {};
-      return moore::RandomBIOp::create(builder, loc, seed);
-    }
-    // Slang already checks the arity of `$random`.
-    assert(false && "`$random` takes 0 or 1 arguments");
-    return {};
+    return moore::UrandomRangeBIOp::create(builder, loc, minval, maxval, seed);
   }
 
   if (nameId == ksn::URandomRange) {
-    // Slang already checks the arity of `$urandom_range`.
-    assert(numArgs >= 1 && numArgs <= 2 &&
-           "`$urandom_range` takes 1 or 2 arguments");
+    auto i32Ty = moore::IntType::getInt(builder.getContext(), 32);
     auto maxval = convertRvalueExpression(*args[0]);
     if (!maxval)
       return {};
-    Value minval = nullptr;
-    if (numArgs == 2) {
+    Value minval;
+    if (numArgs >= 2) {
       minval = convertRvalueExpression(*args[1]);
       if (!minval)
         return {};
+    } else {
+      minval = moore::ConstantOp::create(builder, loc, i32Ty, 0);
     }
-    return moore::UrandomrangeBIOp::create(builder, loc, maxval, minval);
+    return moore::UrandomRangeBIOp::create(builder, loc, minval, maxval,
+                                           Value{});
   }
 
   //===--------------------------------------------------------------------===//
