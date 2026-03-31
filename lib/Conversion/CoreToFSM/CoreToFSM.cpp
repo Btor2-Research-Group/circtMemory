@@ -626,7 +626,30 @@ public:
   LogicalResult run() {
     SmallVector<seq::CompRegOp> stateRegs;
     SmallVector<seq::CompRegOp> variableRegs;
+    Value foundClock, foundReset = nullptr;
     WalkResult walkResult = moduleOp.walk([&](seq::CompRegOp reg) {
+      auto clk = reg.getClk();
+      auto reset = reg.getReset();
+      if (foundClock) {
+        if (clk != foundClock) {
+          reg.emitError("All registers must have the same clock signal.");
+          return WalkResult::interrupt();
+        }
+      } else {
+        foundClock = clk;
+      }
+
+      if (reset) {
+        if (foundReset) {
+          if (reset != foundReset) {
+            reg.emitError("All registers must have the same reset signal.");
+            return WalkResult::interrupt();
+          }
+        } else {
+          foundReset = reset;
+        }
+      }
+
       // Check that the register type is an integer.
       if (!isa<IntegerType>(reg.getType())) {
         reg.emitError("FSM extraction only supports integer-typed registers");
@@ -1153,6 +1176,15 @@ public:
     front.eraseArguments([&](BlockArgument arg) {
       return asyncResetBlockArguments.contains(arg);
     });
+
+    if (llvm::any_of(front.getArguments(), [](BlockArgument arg) {
+          return arg.getType() == seq::ClockType::get(arg.getContext()) &&
+                 arg.hasNUsesOrMore(1);
+        })) {
+      moduleOp.emitError("Clock uses outside register clocking are not "
+                         "currently supported.");
+      return failure();
+    }
     machine.getBody().front().eraseArguments([&](BlockArgument arg) {
       return arg.getType() == seq::ClockType::get(arg.getContext());
     });

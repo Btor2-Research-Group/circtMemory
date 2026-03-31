@@ -41,6 +41,14 @@ class CutRewriterPassBase<string name, string op> : Pass<name, op> {
            )}]>,
     Option<"test", "test", "bool", "false", "Attach timing to IR for testing">
   ];
+  let statistics = [
+    Statistic<"numCutsCreated", "cuts-created",
+              "Number of cuts created during cut enumeration">,
+    Statistic<"numCutSetsCreated", "cut-sets-created",
+              "Number of cut sets created during cut enumeration">,
+    Statistic<"numCutsRewritten", "cuts-rewritten",
+              "Number of cuts rewritten">,
+  ];
 }
 
 def TechMapper : CutRewriterPassBase<"synth-tech-mapper", "mlir::ModuleOp"> {
@@ -303,7 +311,9 @@ def FunctionalReduction : Pass<"synth-functional-reduction", "hw::HWModuleOp"> {
            "Number of random simulation patterns (must be a positive multiple of 64; "
            "each pattern is one bit in a 64-bit word)">,
     Option<"seed", "seed", "unsigned", "0",
-           "Seed for random pattern generation">
+           "Seed for random pattern generation">,
+    Option<"satSolver", "sat-solver", "std::string", "\"auto\"",
+           "SAT solver backend to use: auto, z3, or cadical">
   ];
   let statistics = [
     Statistic<"numEquivClasses", "num-equiv-classes",

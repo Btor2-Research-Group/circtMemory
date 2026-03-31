@@ -16,6 +16,7 @@
 #include "circt/Dialect/Moore/MooreAttributes.h"
 #include "circt/Support/CustomDirectiveImpl.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Interfaces/FunctionImplementation.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -250,6 +251,67 @@ void InstanceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
     name += portName.getValue();
     setNameFn(result, name);
   }
+}
+
+//===----------------------------------------------------------------------===//
+// CoroutineOp
+//===----------------------------------------------------------------------===//
+
+ParseResult CoroutineOp::parse(OpAsmParser &parser, OperationState &result) {
+  auto buildFuncType =
+      [](Builder &builder, ArrayRef<Type> argTypes, ArrayRef<Type> results,
+         function_interface_impl::VariadicFlag,
+         std::string &) { return builder.getFunctionType(argTypes, results); };
+
+  return function_interface_impl::parseFunctionOp(
+      parser, result, /*allowVariadic=*/false,
+      getFunctionTypeAttrName(result.name), buildFuncType,
+      getArgAttrsAttrName(result.name), getResAttrsAttrName(result.name));
+}
+
+void CoroutineOp::print(OpAsmPrinter &p) {
+  function_interface_impl::printFunctionOp(
+      p, *this, /*isVariadic=*/false, getFunctionTypeAttrName(),
+      getArgAttrsAttrName(), getResAttrsAttrName());
+}
+
+//===----------------------------------------------------------------------===//
+// CallCoroutineOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+CallCoroutineOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto calleeName = getCalleeAttr();
+  auto coroutine =
+      symbolTable.lookupNearestSymbolFrom<CoroutineOp>(*this, calleeName);
+  if (!coroutine)
+    return emitOpError() << "'" << calleeName.getValue()
+                         << "' does not reference a valid 'moore.coroutine'";
+
+  auto type = coroutine.getFunctionType();
+  if (type.getNumInputs() != getNumOperands())
+    return emitOpError() << "has " << getNumOperands()
+                         << " operands, but callee expects "
+                         << type.getNumInputs();
+
+  for (unsigned i = 0, e = type.getNumInputs(); i != e; ++i)
+    if (getOperand(i).getType() != type.getInput(i))
+      return emitOpError() << "operand " << i << " type mismatch: expected "
+                           << type.getInput(i) << ", got "
+                           << getOperand(i).getType();
+
+  if (type.getNumResults() != getNumResults())
+    return emitOpError() << "has " << getNumResults()
+                         << " results, but callee returns "
+                         << type.getNumResults();
+
+  for (unsigned i = 0, e = type.getNumResults(); i != e; ++i)
+    if (getResult(i).getType() != type.getResult(i))
+      return emitOpError() << "result " << i << " type mismatch: expected "
+                           << type.getResult(i) << ", got "
+                           << getResult(i).getType();
+
+  return success();
 }
 
 //===----------------------------------------------------------------------===//
@@ -677,6 +739,13 @@ void ConstantOp::build(OpBuilder &builder, OperationState &result, IntType type,
                        int64_t value, bool isSigned) {
   build(builder, result, type,
         APInt(type.getWidth(), (uint64_t)value, isSigned));
+}
+
+/// This builder constructs a 1-bit boolean constant in the specified domain.
+void ConstantOp::build(OpBuilder &builder, OperationState &result,
+                       Domain domain, bool value) {
+  auto type = IntType::get(builder.getContext(), 1, domain);
+  build(builder, result, type, value ? 1 : 0, /*isSigned=*/false);
 }
 
 OpFoldResult ConstantOp::fold(FoldAdaptor adaptor) {

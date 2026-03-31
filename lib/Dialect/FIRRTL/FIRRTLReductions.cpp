@@ -1154,25 +1154,29 @@ struct ModulePortPruner : public OpReduction<firrtl::FModuleOp> {
     auto ports = module.getPorts();
     auto users = userMap.getUsers(module);
 
-    // Compute which ports can be removed
+    // Compute which ports can be removed.  A port can only be removed if it
+    // is unused in both the module body and across all instances.
     llvm::BitVector portsToRemove(ports.size());
 
-    // If the module has no instances, aggressively remove ports that aren't
-    // used within the module body itself
-    if (users.empty()) {
-      for (size_t portIdx = 0; portIdx < ports.size(); ++portIdx) {
-        auto arg = module.getArgument(portIdx);
-        if (arg.use_empty())
-          portsToRemove.set(portIdx);
-      }
-    } else {
-      // For modules with instances, check if ports are unused across all
-      // instances
+    // Check if ports are unused across all instances.
+    if (!users.empty())
       PortPrunerHelpers::computeUnusedInstancePorts(module, users,
                                                     portsToRemove);
+    else
+      // If there are no instances, all ports are candidates for removal.
+      portsToRemove.set();
+
+    // Additionally check if ports are unused within the module body itself.
+    // A port must be unused in both instances and the module body to be
+    // removable.
+    for (size_t portIdx = 0; portIdx < ports.size(); ++portIdx) {
+      if (!portsToRemove[portIdx])
+        continue;
+      if (!module.getArgument(portIdx).use_empty())
+        portsToRemove.reset(portIdx);
     }
 
-    // Generate one match per removable port
+    // Generate one match per removable port.
     for (size_t portIdx = 0; portIdx < ports.size(); ++portIdx)
       if (portsToRemove[portIdx])
         addMatch(1, portIdx);
@@ -1197,15 +1201,8 @@ struct ModulePortPruner : public OpReduction<firrtl::FModuleOp> {
     PortPrunerHelpers::updateInstancesAndErasePorts(module, users,
                                                     portsToRemove);
 
-    // Erase uses of port arguments within the module body.
-    for (auto portIdx : matches) {
-      // Recursively erase each user and its dependent operations
-      for (auto *user :
-           llvm::make_early_inc_range(module.getArgument(portIdx).getUsers()))
-        reduce::pruneUnusedOps(user, *this);
-    }
-
-    // Remove the ports from the module
+    // Remove the ports from the module.  We don't need to erase users because
+    // matches() already ensured that these ports have no users.
     module.erasePorts(portsToRemove);
 
     return success();
@@ -1327,12 +1324,11 @@ struct ConnectForwarder : public Reduction {
   LogicalResult rewrite(Operation *op) override {
     auto dst = op->getOperand(0);
     auto src = op->getOperand(1);
-    dst.replaceAllUsesWith(src);
+    dst.replaceAllUsesExcept(src, op);
     op->erase();
-    if (auto *dstOp = dst.getDefiningOp())
-      reduce::pruneUnusedOps(dstOp, *this);
-    if (auto *srcOp = src.getDefiningOp())
-      reduce::pruneUnusedOps(srcOp, *this);
+    SmallVector<Operation *> worklist(
+        {dst.getDefiningOp(), src.getDefiningOp()});
+    reduce::pruneUnusedOps(worklist, *this);
     return success();
   }
 
@@ -1737,6 +1733,30 @@ struct ObjectInliner : public OpReduction<ObjectOp> {
   ::detail::SymbolCache symbols;
   NLARemover nlaRemover;
   std::unique_ptr<hw::InnerSymbolTableCollection> innerSymTables;
+};
+
+/// Reduction that converts `regreset` to `reg` by dropping reset and init
+/// value.
+struct ResetDisconnector : public OpReduction<RegResetOp> {
+  uint64_t match(RegResetOp op) override { return 1; }
+
+  LogicalResult rewrite(RegResetOp regResetOp) override {
+    ImplicitLocOpBuilder builder(regResetOp.getLoc(), regResetOp);
+    auto regOp = RegOp::create(
+        builder, regResetOp.getResult().getType(), regResetOp.getClockVal(),
+        regResetOp.getNameAttr(), regResetOp.getNameKindAttr(),
+        regResetOp.getAnnotationsAttr(), regResetOp.getInnerSymAttr(),
+        regResetOp.getForceableAttr());
+
+    regResetOp.getResult().replaceAllUsesWith(regOp.getResult());
+    if (regResetOp.getForceable())
+      regResetOp.getRef().replaceAllUsesWith(regOp.getRef());
+    regResetOp.erase();
+
+    return success();
+  }
+
+  std::string getName() const override { return "reset-disconnector"; }
 };
 
 /// Psuedo-reduction that sanitizes the names of things inside modules.  This is
@@ -2546,6 +2566,40 @@ struct ListCreateElementRemover : public OpReduction<ListCreateOp> {
   }
 };
 
+/// Reduction that removes the `convention` attribute from regular modules.
+struct ModuleConventionRemover : public OpReduction<FModuleOp> {
+  uint64_t match(FModuleOp module) override {
+    return module.getConvention() != Convention::Internal;
+  }
+
+  LogicalResult rewrite(FModuleOp module) override {
+    module.setConvention(Convention::Internal);
+    return success();
+  }
+
+  std::string getName() const override { return "module-convention-remover"; }
+  bool acceptSizeIncrease() const override { return true; }
+  bool isOneShot() const override { return true; }
+};
+
+/// Reduction that removes the `convention` attribute from external modules.
+struct ExtmoduleConventionRemover : public OpReduction<FExtModuleOp> {
+  uint64_t match(FExtModuleOp extmodule) override {
+    return extmodule.getConvention() != Convention::Internal;
+  }
+
+  LogicalResult rewrite(FExtModuleOp extmodule) override {
+    extmodule.setConvention(Convention::Internal);
+    return success();
+  }
+
+  std::string getName() const override {
+    return "extmodule-convention-remover";
+  }
+  bool acceptSizeIncrease() const override { return true; }
+  bool isOneShot() const override { return true; }
+};
+
 //===----------------------------------------------------------------------===//
 // Reduction Registration
 //===----------------------------------------------------------------------===//
@@ -2587,7 +2641,8 @@ void firrtl::FIRRTLReducePatternDialectInterface::populateReducePatterns(
   patterns.add<PassReduction, 17>(
       getContext(),
       firrtl::createRemoveUnusedPorts({/*ignoreDontTouch=*/true}));
-  patterns.add<NodeSymbolRemover, 15>();
+  patterns.add<NodeSymbolRemover, 16>();
+  patterns.add<PassReduction, 15>(getContext(), firrtl::createIMDeadCodeElim());
   patterns.add<ConnectForwarder, 14>();
   patterns.add<ConnectInvalidator, 13>();
   patterns.add<Constantifier, 12>();
@@ -2595,6 +2650,7 @@ void firrtl::FIRRTLReducePatternDialectInterface::populateReducePatterns(
   patterns.add<FIRRTLOperandForwarder<1>, 10>();
   patterns.add<FIRRTLOperandForwarder<2>, 9>();
   patterns.add<ListCreateElementRemover, 8>();
+  patterns.add<ResetDisconnector, 8>();
   patterns.add<DetachSubaccesses, 7>();
   patterns.add<ModulePortPruner, 7>();
   patterns.add<ExtmodulePortPruner, 6>();
@@ -2606,6 +2662,8 @@ void firrtl::FIRRTLReducePatternDialectInterface::populateReducePatterns(
   patterns.add<ConnectSourceOperandForwarder<2>, 1>();
   patterns.add<ModuleInternalNameSanitizer, 0>();
   patterns.add<ModuleNameSanitizer, 0>();
+  patterns.add<ModuleConventionRemover, 0>();
+  patterns.add<ExtmoduleConventionRemover, 0>();
 }
 
 void firrtl::registerReducePatternDialectInterface(

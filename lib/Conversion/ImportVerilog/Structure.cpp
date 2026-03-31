@@ -293,6 +293,13 @@ struct ModuleVisitor : public BaseVisitor {
     auto prefix = (Twine(blockNamePrefix) + instNode.name + "_").str();
     auto lowering = std::make_unique<InterfaceLowering>();
 
+    auto recordMember = [&](const slang::ast::Symbol &sym,
+                            Value value) -> void {
+      lowering->expandedMembers[&sym] = value;
+      auto nameAttr = builder.getStringAttr(sym.name);
+      lowering->expandedMembersByName[nameAttr] = value;
+    };
+
     for (const auto &member : instNode.body.members()) {
       // Error on nested interface instances.
       if (const auto *nestedInst = member.as_if<slang::ast::InstanceSymbol>()) {
@@ -312,7 +319,7 @@ struct ModuleVisitor : public BaseVisitor {
             moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
             builder.getStringAttr(Twine(prefix) + StringRef(var->name)),
             Value());
-        lowering->expandedMembers[var] = varOp;
+        recordMember(*var, varOp);
         continue;
       }
       // Expand nets
@@ -331,10 +338,33 @@ struct ModuleVisitor : public BaseVisitor {
             moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
             builder.getStringAttr(Twine(prefix) + StringRef(net->name)),
             netKind, Value());
-        lowering->expandedMembers[net] = netOp;
+        recordMember(*net, netOp);
         continue;
       }
       // Silently skip other members (modports, parameters , etc.)
+    }
+
+    // Record interface ports by mapping them to their connected expressions.
+    // This is required for virtual interface usage (e.g. `vif.clk`) and for
+    // modports that reference interface ports.
+    for (const auto *con : instNode.getPortConnections()) {
+      const auto *expr = con->getExpression();
+      const auto *port = con->port.as_if<slang::ast::PortSymbol>();
+      if (!port)
+        continue;
+      if (!expr) {
+        // Leave unconnected interface ports unresolved for now.
+        continue;
+      }
+
+      Value lvalue = context.convertLvalueExpression(*expr);
+      if (!lvalue)
+        return failure();
+
+      recordMember(*port, lvalue);
+      if (port->internalSymbol) {
+        recordMember(*port->internalSymbol, lvalue);
+      }
     }
 
     context.interfaceInstanceStorage.push_back(std::move(lowering));
@@ -643,6 +673,10 @@ struct ModuleVisitor : public BaseVisitor {
         moore::RefType::get(cast<moore::UnpackedType>(loweredType)),
         builder.getStringAttr(Twine(blockNamePrefix) + varNode.name), initial);
     context.valueSymbols.insert(&varNode, varOp);
+    const auto &canonTy = varNode.getType().getCanonicalType();
+    if (const auto *vi = canonTy.as_if<slang::ast::VirtualInterfaceType>())
+      if (failed(context.registerVirtualInterfaceMembers(varNode, *vi, loc)))
+        return failure();
     return success();
   }
 
@@ -716,6 +750,8 @@ struct ModuleVisitor : public BaseVisitor {
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPointToEnd(&procOp.getBody().emplaceBlock());
     Context::ValueSymbolScope scope(context.valueSymbols);
+    Context::VirtualInterfaceMemberScope vifMemberScope(
+        context.virtualIfaceMembers);
     if (failed(context.convertStatement(body)))
       return failure();
     if (builder.getBlock())
@@ -1024,6 +1060,8 @@ Context::convertModuleHeader(const slang::ast::InstanceBodySymbol *module) {
                                    &ifacePort) {
       auto portLoc = convertLocation(ifacePort.location);
       auto [connSym, modportSym] = ifacePort.getConnection();
+      const auto *ifaceInst =
+          connSym ? connSym->as_if<slang::ast::InstanceSymbol>() : nullptr;
       auto portPrefix = (Twine(ifacePort.name) + "_").str();
 
       if (modportSym) {
@@ -1051,8 +1089,9 @@ Context::convertModuleHeader(const slang::ast::InstanceBodySymbol *module) {
             arg = block->addArgument(type, portLoc);
             inputIdx++;
           }
-          lowering.ifacePorts.push_back(
-              {name, dir, type, portLoc, arg, &ifacePort, mpp->internalSymbol});
+          lowering.ifacePorts.push_back({name, dir, type, portLoc, arg,
+                                         &ifacePort, mpp->internalSymbol,
+                                         ifaceInst});
         }
       } else {
         // No modport: iterate interface body for all variables and nets.
@@ -1086,7 +1125,8 @@ Context::convertModuleHeader(const slang::ast::InstanceBodySymbol *module) {
           auto arg = block->addArgument(refType, portLoc);
           inputIdx++;
           lowering.ifacePorts.push_back({name, hw::ModulePort::Input, refType,
-                                         portLoc, arg, &ifacePort, bodySym});
+                                         portLoc, arg, &ifacePort, bodySym,
+                                         instSym});
         }
       }
       return success();
@@ -1172,6 +1212,7 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
 
   ValueSymbolScope scope(valueSymbols);
   InterfaceInstanceScope ifaceScope(interfaceInstances);
+  VirtualInterfaceMemberScope vifMemberScope(virtualIfaceMembers);
 
   // Keep track of the local time scale. `getTimeScale` automatically looks
   // through parent scopes to find the time scale effective locally.
@@ -1187,10 +1228,72 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
       valueSymbols.insert(hierPath.valueSym,
                           lowering.op.getBody()->getArgument(*hierPath.idx));
 
+  // Register flattened interface port members before lowering the module body
+  // so expressions can refer to them. Also build per-port interface instance
+  // lowerings, which enables materializing virtual interface values from
+  // interface ports.
+  DenseMap<const slang::ast::InstanceSymbol *, InterfaceLowering *>
+      ifacePortLowerings;
+
+  auto getIfacePortLowering =
+      [&](const slang::ast::InstanceSymbol *ifaceInst) -> InterfaceLowering * {
+    if (!ifaceInst)
+      return nullptr;
+    if (auto *existing = interfaceInstances.lookup(ifaceInst))
+      return existing;
+    if (auto it = ifacePortLowerings.find(ifaceInst);
+        it != ifacePortLowerings.end())
+      return it->second;
+
+    auto lowering = std::make_unique<InterfaceLowering>();
+    InterfaceLowering *ptr = lowering.get();
+    interfaceInstanceStorage.push_back(std::move(lowering));
+    interfaceInstances.insert(ifaceInst, ptr);
+    ifacePortLowerings.try_emplace(ifaceInst, ptr);
+    return ptr;
+  };
+
+  for (auto &fp : lowering.ifacePorts) {
+    if (!fp.bodySym)
+      continue;
+    auto *valueSym = fp.bodySym->as_if<slang::ast::ValueSymbol>();
+    if (!valueSym)
+      continue;
+
+    if (fp.direction == hw::ModulePort::Output) {
+      // Output interface ports are not referenceable within the module body.
+      // Create internal variables for them and return their value through the
+      // module terminator.
+      auto varOp = moore::VariableOp::create(
+          builder, fp.loc,
+          moore::RefType::get(cast<moore::UnpackedType>(fp.type)), fp.name,
+          Value());
+      valueSymbols.insert(valueSym, varOp);
+    } else {
+      valueSymbols.insert(valueSym, fp.arg);
+    }
+
+    if (!fp.ifaceInstance)
+      continue;
+    if (Value val = valueSymbols.lookup(valueSym)) {
+      auto *ifaceLowering = getIfacePortLowering(fp.ifaceInstance);
+      if (!ifaceLowering)
+        continue;
+      ifaceLowering->expandedMembers[fp.bodySym] = val;
+      ifaceLowering
+          ->expandedMembersByName[builder.getStringAttr(fp.bodySym->name)] =
+          val;
+    }
+  }
+
   // Convert the body of the module.
   for (auto &member : module->members()) {
     auto loc = convertLocation(member.location);
     if (failed(member.visit(ModuleVisitor(*this, loc))))
+      return failure();
+    // Flush any pending monitors after each member. This places the monitor
+    // procedures immediately after the code that sets them up.
+    if (failed(flushPendingMonitors()))
       return failure();
   }
 
@@ -1228,35 +1331,19 @@ Context::convertModuleBody(const slang::ast::InstanceBodySymbol *module) {
     moore::ContinuousAssignOp::create(builder, port.loc, value, portArg);
   }
 
-  // Handle flattened interface ports. For each flattened port, create an
-  // internal variable and wire it to the port. The variable is registered
-  // in valueSymbols so the module body can reference interface signals
+  // Collect output values for flattened interface ports. The internal
+  // references are set up before lowering the module body.
   for (auto &fp : lowering.ifacePorts) {
-    if (!fp.bodySym)
+    if (fp.direction != hw::ModulePort::Output)
       continue;
-    // Look up the body sym's value (populated by the module body visitor
-    // if the interface body symbol was visited, which it won't be since
-    // interface port don't have a body in the module).
-    // Instead, create a new variable for this flattened port signal.
-    auto *valueSym = fp.bodySym->as_if<slang::ast::ValueSymbol>();
+    auto *valueSym =
+        fp.bodySym ? fp.bodySym->as_if<slang::ast::ValueSymbol>() : nullptr;
     if (!valueSym)
       continue;
-
-    if (fp.direction == hw::ModulePort::Output) {
-      // For output ports: create a variable, register it, and read it
-      // for the output terminator
-      auto varOp = moore::VariableOp::create(
-          builder, fp.loc,
-          moore::RefType::get(cast<moore::UnpackedType>(fp.type)), fp.name,
-          Value());
-      valueSymbols.insert(valueSym, varOp);
-      auto readVal = moore::ReadOp::create(builder, fp.loc, varOp);
-      outputs.push_back(readVal);
-    } else {
-      // For input ports: register the block argument so the module body
-      // can reference the interface signal
-      valueSymbols.insert(valueSym, fp.arg);
-    }
+    Value ref = valueSymbols.lookup(valueSym);
+    if (!ref)
+      continue;
+    outputs.push_back(moore::ReadOp::create(builder, fp.loc, ref).getResult());
   }
 
   // Ensure the number of operands of this module's terminator and the number of
@@ -1406,11 +1493,22 @@ Context::declareCallableImpl(const slang::ast::SubroutineSymbol &subroutine,
   auto funcTy = getFunctionSignature(*this, subroutine, extraParams);
   if (!funcTy)
     return nullptr;
-  auto funcOp = mlir::func::FuncOp::create(builder, loc, qualifiedName, funcTy);
 
-  SymbolTable::setSymbolVisibility(funcOp, SymbolTable::Visibility::Private);
+  // Create a coroutine for tasks (which can suspend) or a function for
+  // functions (which cannot).
+  Operation *funcOp;
+  if (subroutine.subroutineKind == slang::ast::SubroutineKind::Task) {
+    auto op = moore::CoroutineOp::create(builder, loc, qualifiedName, funcTy);
+    SymbolTable::setSymbolVisibility(op, SymbolTable::Visibility::Private);
+    lowering->op = op;
+    funcOp = op;
+  } else {
+    auto op = mlir::func::FuncOp::create(builder, loc, qualifiedName, funcTy);
+    SymbolTable::setSymbolVisibility(op, SymbolTable::Visibility::Private);
+    lowering->op = op;
+    funcOp = op;
+  }
   orderedRootOps.insert(it, {subroutine.location, funcOp});
-  lowering->op = funcOp;
 
   // Add the function to the symbol table of the MLIR module, which uniquifies
   // its name.
@@ -1423,59 +1521,66 @@ Context::declareCallableImpl(const slang::ast::SubroutineSymbol &subroutine,
 /// Special case handling for recursive functions with captures;
 /// this function fixes the in-body call of the recursive function with
 /// the captured arguments.
-static LogicalResult rewriteCallSitesToPassCaptures(mlir::func::FuncOp callee,
-                                                    ArrayRef<Value> captures) {
+static LogicalResult
+rewriteCallSitesToPassCaptures(FunctionLowering &lowering) {
+  auto &captures = lowering.captures;
   if (captures.empty())
     return success();
 
+  auto *callee = lowering.op.getOperation();
   mlir::ModuleOp module = callee->getParentOfType<mlir::ModuleOp>();
   if (!module)
-    return callee.emitError("expected callee to be nested under ModuleOp");
+    return lowering.op.emitError("expected callee to be nested under ModuleOp");
 
   auto usesOpt = mlir::SymbolTable::getSymbolUses(callee, module);
   if (!usesOpt)
-    return callee.emitError("failed to compute symbol uses");
+    return lowering.op.emitError("failed to compute symbol uses");
 
-  // Snapshot the relevant users before we mutate IR.
-  SmallVector<mlir::func::CallOp, 8> callSites;
-  callSites.reserve(std::distance(usesOpt->begin(), usesOpt->end()));
+  // Snapshot the relevant call users before we mutate IR.
+  SmallVector<Operation *, 8> callSites;
   for (const mlir::SymbolTable::SymbolUse &use : *usesOpt) {
-    if (auto call = llvm::dyn_cast<mlir::func::CallOp>(use.getUser()))
-      callSites.push_back(call);
+    auto *user = use.getUser();
+    if (isa<mlir::func::CallOp>(user) || isa<moore::CallCoroutineOp>(user))
+      callSites.push_back(user);
   }
   if (callSites.empty())
     return success();
 
-  Block &entry = callee.getBody().front();
+  Block &entry = lowering.op.getFunctionBody().front();
   const unsigned numCaps = captures.size();
   const unsigned numEntryArgs = entry.getNumArguments();
   if (numEntryArgs < numCaps)
-    return callee.emitError("entry block has fewer args than captures");
+    return lowering.op.emitError("entry block has fewer args than captures");
   const unsigned capArgStart = numEntryArgs - numCaps;
 
-  // Current (finalized) function type.
-  auto fTy = callee.getFunctionType();
+  auto fTy = cast<FunctionType>(lowering.op.getFunctionType());
 
-  for (auto call : callSites) {
-    SmallVector<Value> newOperands(call.getArgOperands().begin(),
-                                   call.getArgOperands().end());
+  for (auto *callOp : callSites) {
+    // Get the existing operands from the call.
+    auto argOperands = callOp->getOperands();
+    SmallVector<Value> newOperands(argOperands.begin(), argOperands.end());
 
-    const bool inSameFunc = callee->isProperAncestor(call);
+    const bool inSameFunc = callee->isProperAncestor(callOp);
     if (inSameFunc) {
-      // Append the function’s *capture block arguments* in order.
       for (unsigned i = 0; i < numCaps; ++i)
         newOperands.push_back(entry.getArgument(capArgStart + i));
     } else {
-      // External call site: pass the captured SSA values.
       newOperands.append(captures.begin(), captures.end());
     }
 
-    OpBuilder b(call);
-    auto flatRef = mlir::FlatSymbolRefAttr::get(callee);
-    auto newCall = mlir::func::CallOp::create(
-        b, call.getLoc(), fTy.getResults(), flatRef, newOperands);
-    call->replaceAllUsesWith(newCall.getOperation());
-    call->erase();
+    OpBuilder b(callOp);
+    auto flatRef = mlir::FlatSymbolRefAttr::get(callee->getContext(),
+                                                lowering.op.getName());
+    Operation *newCall;
+    if (lowering.isCoroutine()) {
+      newCall = moore::CallCoroutineOp::create(
+          b, callOp->getLoc(), fTy.getResults(), flatRef, newOperands);
+    } else {
+      newCall = mlir::func::CallOp::create(
+          b, callOp->getLoc(), fTy.getResults(), flatRef, newOperands);
+    }
+    callOp->replaceAllUsesWith(newCall);
+    callOp->erase();
   }
 
   return success();
@@ -1511,16 +1616,36 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   const bool isMethod = (subroutine.thisVar != nullptr);
 
   ValueSymbolScope scope(valueSymbols);
+  VirtualInterfaceMemberScope vifMemberScope(virtualIfaceMembers);
+
+  if (isMethod) {
+    if (const auto *classTy =
+            subroutine.thisVar->getType().as_if<slang::ast::ClassType>()) {
+      for (auto &member : classTy->members()) {
+        const auto *prop = member.as_if<slang::ast::ClassPropertySymbol>();
+        if (!prop)
+          continue;
+        const auto &propCanon = prop->getType().getCanonicalType();
+        if (const auto *vi =
+                propCanon.as_if<slang::ast::VirtualInterfaceType>()) {
+          auto propLoc = convertLocation(prop->location);
+          if (failed(registerVirtualInterfaceMembers(*prop, *vi, propLoc)))
+            return failure();
+        }
+      }
+    }
+  }
 
   // Create a function body block and populate it with block arguments.
   SmallVector<moore::VariableOp> argVariables;
-  auto &block = lowering->op.getBody().emplaceBlock();
+  auto &block = lowering->op.getFunctionBody().emplaceBlock();
 
   // If this is a class method, the first input is %this :
   // !moore.class<@C>
   if (isMethod) {
     auto thisLoc = convertLocation(subroutine.location);
-    auto thisType = lowering->op.getFunctionType().getInput(0);
+    auto thisType =
+        cast<FunctionType>(lowering->op.getFunctionType()).getInput(0);
     auto thisArg = block.addArgument(thisType, thisLoc);
 
     // Bind `this` so NamedValue/MemberAccess can find it.
@@ -1528,7 +1653,7 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   }
 
   // Add user-defined block arguments
-  auto inputs = lowering->op.getFunctionType().getInputs();
+  auto inputs = cast<FunctionType>(lowering->op.getFunctionType()).getInputs();
   auto astArgs = subroutine.getArguments();
   auto valInputs = llvm::ArrayRef<Type>(inputs).drop_front(isMethod ? 1 : 0);
 
@@ -1548,6 +1673,11 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
       valueSymbols.insert(astArg, shadowArg);
       argVariables.push_back(shadowArg);
     }
+
+    const auto &argCanon = astArg->getType().getCanonicalType();
+    if (const auto *vi = argCanon.as_if<slang::ast::VirtualInterfaceType>())
+      if (failed(registerVirtualInterfaceMembers(*astArg, *vi, loc)))
+        return failure();
   }
 
   // Convert the body of the function.
@@ -1585,7 +1715,7 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
 
     // Don't capture anything that's a local reference
     mlir::Region *defReg = ref.getParentRegion();
-    if (defReg && lowering->op.getBody().isAncestor(defReg))
+    if (defReg && lowering->op.getFunctionBody().isAncestor(defReg))
       return;
 
     // If we've already recorded this capture, skip.
@@ -1618,7 +1748,7 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
 
     // Don't capture anything that's a local reference
     mlir::Region *defReg = dstRef.getParentRegion();
-    if (defReg && lowering->op.getBody().isAncestor(defReg))
+    if (defReg && lowering->op.getFunctionBody().isAncestor(defReg))
       return;
 
     // If we've already recorded this capture, skip.
@@ -1652,13 +1782,15 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
 
   // For the special case of recursive functions, fix the call sites within the
   // body
-  if (failed(rewriteCallSitesToPassCaptures(lowering->op, lowering->captures)))
+  if (failed(rewriteCallSitesToPassCaptures(*lowering)))
     return failure();
 
   // If there was no explicit return statement provided by the user, insert a
   // default one.
   if (builder.getBlock()) {
-    if (returnVar && !subroutine.getReturnType().isVoid()) {
+    if (lowering->isCoroutine()) {
+      moore::ReturnOp::create(builder, lowering->op.getLoc());
+    } else if (returnVar && !subroutine.getReturnType().isVoid()) {
       Value read =
           moore::ReadOp::create(builder, returnVar.getLoc(), returnVar);
       mlir::func::ReturnOp::create(builder, lowering->op.getLoc(), read);
@@ -1693,8 +1825,9 @@ Context::finalizeFunctionBodyCaptures(FunctionLowering &lowering) {
   MLIRContext *ctx = getContext();
 
   // Build new input type list: existing inputs + capture ref types.
-  SmallVector<Type> newInputs(lowering.op.getFunctionType().getInputs().begin(),
-                              lowering.op.getFunctionType().getInputs().end());
+  SmallVector<Type> newInputs(
+      cast<FunctionType>(lowering.op.getFunctionType()).getInputs().begin(),
+      cast<FunctionType>(lowering.op.getFunctionType()).getInputs().end());
 
   for (Value cap : lowering.captures) {
     // Expect captures to be refs.
@@ -1708,11 +1841,12 @@ Context::finalizeFunctionBodyCaptures(FunctionLowering &lowering) {
 
   // Results unchanged.
   auto newFuncTy = FunctionType::get(
-      ctx, newInputs, lowering.op.getFunctionType().getResults());
-  lowering.op.setFunctionType(newFuncTy);
+      ctx, newInputs,
+      cast<FunctionType>(lowering.op.getFunctionType()).getResults());
+  lowering.op.setType(newFuncTy);
 
   // Add the new block arguments to the entry block.
-  Block &entry = lowering.op.getBody().front();
+  Block &entry = lowering.op.getFunctionBody().front();
   SmallVector<Value> capArgs;
   capArgs.reserve(lowering.captures.size());
   for (Type t :
@@ -1989,7 +2123,7 @@ struct ClassMethodVisitor : ClassDeclVisitorBase {
       return success();
 
     // Grab the finalized function type from the lowered func.op.
-    FunctionType fnTy = lowering->op.getFunctionType();
+    FunctionType fnTy = cast<FunctionType>(lowering->op.getFunctionType());
     // Emit the method decl into the class body, preserving source order.
     moore::ClassMethodDeclOp::create(builder, loc, fn.name, fnTy,
                                      SymbolRefAttr::get(lowering->op));
@@ -2179,6 +2313,10 @@ Context::convertGlobalVariable(const slang::ast::VariableSymbol &var) {
                                                cast<moore::UnpackedType>(type));
   orderedRootOps.insert({var.location, varOp});
   globalVariables.insert({&var, varOp});
+
+  // Add the variable to the symbol table of the MLIR module, which uniquifies
+  // its name.
+  symbolTable.insert(varOp);
 
   // If the variable has an initializer expression, remember it for later such
   // that we can convert the initializers once we have seen all global

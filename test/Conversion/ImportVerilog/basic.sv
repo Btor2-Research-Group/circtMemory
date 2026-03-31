@@ -2133,7 +2133,7 @@ function void ConvertConditionalExprsToResultType(bit [15:0] x, struct packed { 
   r = z ? y : x;
 endfunction
 
-// CHECK-LABEL: func.func private @ImplicitEventControl(
+// CHECK-LABEL: moore.coroutine private @ImplicitEventControl(
 // CHECK-SAME: [[X:%[^:]+]]: !moore.ref<i32>
 // CHECK-SAME: [[Y:%[^:]+]]: !moore.ref<i32>
 task automatic ImplicitEventControl(ref int x, ref int y);
@@ -2163,7 +2163,7 @@ task automatic ImplicitEventControl(ref int x, ref int y);
   @* dummyD(x + y);
 endtask
 
-// CHECK-LABEL: func.func private @DelayControl(
+// CHECK-LABEL: moore.coroutine private @DelayControl(
 // CHECK-SAME: [[X:%[^:]+]]: !moore.time
 task automatic DelayControl(time x);
   // CHECK: [[TMP:%.+]] = moore.constant_time 1234000 fs
@@ -2176,7 +2176,7 @@ task automatic DelayControl(time x);
   #x dummyA();
 endtask
 
-// CHECK-LABEL: func.func private @SignalEventControl(
+// CHECK-LABEL: moore.coroutine private @SignalEventControl(
 // CHECK-SAME: [[X:%[^:]+]]: !moore.ref<i32>
 // CHECK-SAME: [[Y:%[^:]+]]: !moore.ref<i32>
 // CHECK-SAME: [[T:%[^:]+]]: !moore.ref<i1>
@@ -2275,7 +2275,7 @@ task automatic SignalEventControl(ref int x, ref int y, ref bit t, ref bit u, re
   @(posedge t iff u, negedge u iff v) dummyA();
 endtask
 
-// CHECK-LABEL: func.func private @ImplicitEventControlExamples(
+// CHECK-LABEL: moore.coroutine private @ImplicitEventControlExamples(
 task automatic ImplicitEventControlExamples();
   // Taken from IEEE 1800-2017 section 9.4.2.2 "Implicit event_expression list".
   bit a, b, c, d, f, y, tmp1, tmp2;
@@ -3568,7 +3568,7 @@ module ContinuousAssignment;
   assign #1ns c = ~b;
 endmodule
 
-// CHECK-LABEL: func.func private @BlockingAssignment(
+// CHECK-LABEL: moore.coroutine private @BlockingAssignment(
 // CHECK-SAME: [[A:%.+]]: !moore.ref<i42>
 // CHECK-SAME: [[B:%.+]]: !moore.i42
 // CHECK-SAME: [[C:%.+]]: !moore.i1
@@ -3595,7 +3595,7 @@ task BlockingAssignment(
   a = @(posedge c) ~b;
 endtask
 
-// CHECK-LABEL: func.func private @NonBlockingAssignment(
+// CHECK-LABEL: moore.coroutine private @NonBlockingAssignment(
 // CHECK-SAME: [[A:%.+]]: !moore.ref<i42>
 // CHECK-SAME: [[B:%.+]]: !moore.i42
 task NonBlockingAssignment(
@@ -3696,11 +3696,11 @@ module testLHSTaskCapture();
     endtask
 
     always @(posedge a) begin
-        // CHECK: func.call @testTaskCapture([[A]]) : (!moore.ref<l1>) -> ()
+        // CHECK: moore.call_coroutine @testTaskCapture([[A]]) : (!moore.ref<l1>) -> ()
         testTaskCapture;
     end
 
-    // CHECK: func.func private @testTaskCapture(%arg0: !moore.ref<l1>) {
+    // CHECK: moore.coroutine private @testTaskCapture(%arg0: !moore.ref<l1>) {
     // CHECK: [[CONST:%.+]] = moore.constant 0 : l1
     // CHECK: moore.blocking_assign %arg0, [[CONST]] : l1
 
@@ -3734,6 +3734,44 @@ module testRecursiveCaptureFunction();
     // CHECK: [[REC_CALL:%.*]] = call @fact({{.*}}, %arg1) : (!moore.i32, !moore.ref<i32>) -> !moore.i32
     return n * fact(n - 1);
   endfunction
+endmodule
+
+// Task that reads a module-scope signal in an event control expression. The
+// signal must be captured as an extra argument to the task function.
+// CHECK-LABEL: moore.module @CaptureInEventControl
+module CaptureInEventControl;
+  // CHECK: [[CLK:%.+]] = moore.variable : <l1>
+  logic clk;
+  // CHECK: [[DATA:%.+]] = moore.variable : <i32>
+  int data;
+
+  initial begin
+    // CHECK: moore.call_coroutine @waitForClk([[CLK]])
+    waitForClk();
+    // CHECK: moore.call_coroutine @readOnClk([[CLK]], [[DATA]])
+    readOnClk();
+  end
+
+  // CHECK: moore.coroutine private @waitForClk(%arg0: !moore.ref<l1>)
+  task automatic waitForClk;
+    // CHECK: moore.wait_event {
+    // CHECK:   [[TMP:%.+]] = moore.read %arg0
+    // CHECK:   moore.detect_event posedge [[TMP]]
+    // CHECK: }
+    @(posedge clk);
+  endtask
+
+  // CHECK: moore.coroutine private @readOnClk(%arg0: !moore.ref<l1>, %arg1: !moore.ref<i32>)
+  task automatic readOnClk;
+    int result;
+    // CHECK: moore.wait_event {
+    // CHECK:   [[TMP:%.+]] = moore.read %arg0
+    // CHECK:   moore.detect_event posedge [[TMP]]
+    // CHECK: }
+    @(posedge clk);
+    // CHECK: [[TMP:%.+]] = moore.read %arg1
+    result = data;
+  endtask
 endmodule
 
 // CHECK-LABEL: moore.module @RealLiteral() {
@@ -4878,8 +4916,8 @@ endinterface
 
 // CHECK-LABEL: moore.module private @HasModport(out bus_data : !moore.l8, out bus_valid : !moore.l1) {
 // CHECK:         %bus_data = moore.variable : <l8>
-// CHECK:         [[D:%.+]] = moore.read %bus_data : <l8>
 // CHECK:         %bus_valid = moore.variable : <l1>
+// CHECK:         [[D:%.+]] = moore.read %bus_data : <l8>
 // CHECK:         [[V:%.+]] = moore.read %bus_valid : <l1>
 // CHECK:         moore.output [[D]], [[V]] : !moore.l8, !moore.l1
 // CHECK:       }
@@ -4985,12 +5023,12 @@ endmodule
 // Test G: Two ports of the same interface type on one module.
 // CHECK-LABEL: moore.module private @TwoPortsSameType(out a_data : !moore.l8, out a_valid : !moore.l1, out b_data : !moore.l8, out b_valid : !moore.l1) {
 // CHECK:         %a_data = moore.variable : <l8>
-// CHECK:         [[AD:%.+]] = moore.read %a_data : <l8>
 // CHECK:         %a_valid = moore.variable : <l1>
-// CHECK:         [[AV:%.+]] = moore.read %a_valid : <l1>
 // CHECK:         %b_data = moore.variable : <l8>
-// CHECK:         [[BD:%.+]] = moore.read %b_data : <l8>
 // CHECK:         %b_valid = moore.variable : <l1>
+// CHECK:         [[AD:%.+]] = moore.read %a_data : <l8>
+// CHECK:         [[AV:%.+]] = moore.read %a_valid : <l1>
+// CHECK:         [[BD:%.+]] = moore.read %b_data : <l8>
 // CHECK:         [[BV:%.+]] = moore.read %b_valid : <l1>
 // CHECK:         moore.output [[AD]], [[AV]], [[BD]], [[BV]] : !moore.l8, !moore.l1, !moore.l8, !moore.l1
 // CHECK:       }
@@ -5105,4 +5143,3 @@ module DynamicArrayDeleteTest;
   end
 
 endmodule
-
