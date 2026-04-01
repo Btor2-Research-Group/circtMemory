@@ -15,21 +15,6 @@
 
 include "mlir/Pass/PassBase.td"
 
-def UndefinedMemBehavior : Pass<"undefined-mem-behavior", "hw::HWModuleOp"> {
-  let summary = "Implement support for undefined memory operations";
-  let description = [{
-    This pass encodes behavior that is left undefined by using a random node to 
-    decide what happens at runtime. Supports 2 operations:
-    1. Synchronous read/write
-    2. Read out of bounds
-  }];
-  let constructor = "circt::seq::createUndefinedMemBehaviorPass()";
-  let dependentDialects = [
-    "circt::hw::HWDialect",
-    "circt::comb::CombDialect"
-    ];
-}
-
 def LowerSeqCompRegCE : Pass<"lower-seq-compreg-ce", "hw::HWModuleOp"> {
   let summary = "Lower seq.compreg.ce to seq.compreg";
   let description = [{
@@ -140,6 +125,21 @@ def RegOfVecToMem : Pass<"seq-reg-of-vec-to-mem", "hw::HWModuleOp"> {
     3. Updates are controlled by enable signals through mux operations
     4. Read and write operations use the same clock
   }];
+}
+
+def UndefinedMemoryBehavior : Pass<"undefined-memory-behavior", "hw::HWModuleOp"> {
+  let summary = "Implement support for undefined memory operations";
+  let description = [{
+    This pass encodes behavior that is left undefined by using a random node to 
+    decide what happens at runtime. Supports 2 operations:
+    1. Synchronous read/write
+    2. Read out of bounds
+  }];
+  let constructor = "circt::seq::createUndefinedMemoryBehaviorPass()";
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect"
+    ];
 }
 
 #endif // CIRCT_DIALECT_SEQ_SEQPASSES
