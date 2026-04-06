@@ -10,6 +10,7 @@
 #ifndef CONVERSION_IMPORTVERILOG_IMPORTVERILOGINTERNALS_H
 #define CONVERSION_IMPORTVERILOG_IMPORTVERILOGINTERNALS_H
 
+#include "CaptureAnalysis.h"
 #include "circt/Conversion/ImportVerilog.h"
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -96,10 +97,11 @@ struct ModuleLowering {
 /// accessed through the `FunctionOpInterface`.
 struct FunctionLowering {
   mlir::FunctionOpInterface op;
-  llvm::SmallVector<Value, 4> captures;
-  llvm::DenseMap<Value, unsigned> captureIndex;
-  bool capturesFinalized = false;
-  bool isConverting = false;
+
+  /// The AST symbols captured by this function, determined by the capture
+  /// analysis pre-pass. These are added as extra parameters to the function
+  /// during declaration.
+  SmallVector<const slang::ast::ValueSymbol *, 4> capturedSymbols;
 
   /// Whether this is a coroutine (task) or a regular function.
   bool isCoroutine() { return isa<moore::CoroutineOp>(op.getOperation()); }
@@ -169,8 +171,9 @@ struct Context {
   LogicalResult convertPackage(const slang::ast::PackageSymbol &package);
   FunctionLowering *
   declareFunction(const slang::ast::SubroutineSymbol &subroutine);
-  LogicalResult convertFunction(const slang::ast::SubroutineSymbol &subroutine);
-  LogicalResult finalizeFunctionBodyCaptures(FunctionLowering &lowering);
+  LogicalResult defineFunction(const slang::ast::SubroutineSymbol &subroutine);
+  LogicalResult
+  convertPrimitiveInstance(const slang::ast::PrimitiveInstanceSymbol &prim);
   ClassLowering *declareClass(const slang::ast::ClassType &cls);
   LogicalResult buildClassProperties(const slang::ast::ClassType &classdecl);
   LogicalResult materializeClassMethods(const slang::ast::ClassType &classdecl);
@@ -233,10 +236,7 @@ struct Context {
       const slang::ast::CallExpression::SystemCallInfo &info, Location loc);
 
   // Traverse the whole AST to collect hierarchical names.
-  LogicalResult
-  collectHierarchicalValues(const slang::ast::Expression &expr,
-                            const slang::ast::Symbol &outermostModule);
-  LogicalResult traverseInstanceBody(const slang::ast::Symbol &symbol);
+  void traverseInstanceBody(const slang::ast::Symbol &symbol);
 
   // Convert timing controls into a corresponding set of ops that delay
   // execution of the current block. Produces an error if the implicit event
@@ -255,6 +255,9 @@ struct Context {
   // Convert a slang timing control for LTL
   Value convertLTLTimingControl(const slang::ast::TimingControl &ctrl,
                                 const Value &seqOrPro);
+
+  LogicalResult
+  convertNInputPrimitive(const slang::ast::PrimitiveInstanceSymbol &prim);
 
   /// Helper function to convert a value to its "truthy" boolean value.
   Value convertToBool(Value value);
@@ -320,6 +323,10 @@ struct Context {
   /// Evaluate the constant value of an expression.
   slang::ConstantValue evaluateConstant(const slang::ast::Expression &expr);
 
+  /// Convert the inside/set-membership expression.
+  Value convertInsideCheck(Value insideLhs, Location loc,
+                           const slang::ast::Expression &expr);
+
   const ImportVerilogOptions &options;
   slang::ast::Compilation &compilation;
   mlir::ModuleOp intoModuleOp;
@@ -360,6 +367,10 @@ struct Context {
   /// not been converted yet.
   std::queue<const slang::ast::InstanceBodySymbol *> moduleWorklist;
 
+  /// A list of functions for which the declaration has been created, but the
+  /// body has not been defined yet.
+  std::queue<const slang::ast::SubroutineSymbol *> functionWorklist;
+
   /// Functions that have already been converted.
   DenseMap<const slang::ast::SubroutineSymbol *,
            std::unique_ptr<FunctionLowering>>
@@ -392,6 +403,10 @@ struct Context {
   /// A list of global variables that still need their initializers to be
   /// converted.
   SmallVector<const slang::ast::ValueSymbol *> globalVariableWorklist;
+
+  /// Pre-computed capture analysis: maps each function to the set of non-local,
+  /// non-global variables it captures (directly or transitively).
+  CaptureMap functionCaptures;
 
   /// Collect all hierarchical names used for the per module/instance.
   DenseMap<const slang::ast::InstanceBodySymbol *, SmallVector<HierPathInfo>>

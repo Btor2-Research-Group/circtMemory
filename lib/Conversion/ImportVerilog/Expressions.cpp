@@ -15,6 +15,7 @@
 #include "slang/ast/types/AllTypes.h"
 #include "slang/syntax/AllSyntax.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -1574,58 +1575,16 @@ struct RvalueExprVisitor : public ExprVisitor {
         context.convertRvalueExpression(expr.left()));
     if (!lhs)
       return {};
+
     // All conditions for determining whether it is inside.
     SmallVector<Value> conditions;
 
     // Traverse open range list.
     for (const auto *listExpr : expr.rangeList()) {
-      Value cond;
-      // The open range list on the right-hand side of the inside operator is a
-      // comma-separated list of expressions or ranges.
-      if (const auto *openRange =
-              listExpr->as_if<slang::ast::ValueRangeExpression>()) {
-        // Handle ranges.
-        auto lowBound = context.convertToSimpleBitVector(
-            context.convertRvalueExpression(openRange->left()));
-        auto highBound = context.convertToSimpleBitVector(
-            context.convertRvalueExpression(openRange->right()));
-        if (!lowBound || !highBound)
-          return {};
-        Value leftValue, rightValue;
-        // Determine if the expression on the left-hand side is inclusively
-        // within the range.
-        if (openRange->left().type->isSigned() ||
-            expr.left().type->isSigned()) {
-          leftValue = moore::SgeOp::create(builder, loc, lhs, lowBound);
-        } else {
-          leftValue = moore::UgeOp::create(builder, loc, lhs, lowBound);
-        }
-        if (openRange->right().type->isSigned() ||
-            expr.left().type->isSigned()) {
-          rightValue = moore::SleOp::create(builder, loc, lhs, highBound);
-        } else {
-          rightValue = moore::UleOp::create(builder, loc, lhs, highBound);
-        }
-        cond = moore::AndOp::create(builder, loc, leftValue, rightValue);
-      } else {
-        // Handle expressions.
-        if (!listExpr->type->isIntegral()) {
-          if (listExpr->type->isUnpackedArray()) {
-            mlir::emitError(
-                loc, "unpacked arrays in 'inside' expressions not supported");
-            return {};
-          }
-          mlir::emitError(
-              loc, "only simple bit vectors supported in 'inside' expressions");
-          return {};
-        }
+      auto cond = context.convertInsideCheck(lhs, loc, *listExpr);
+      if (!cond)
+        return {};
 
-        auto value = context.convertToSimpleBitVector(
-            context.convertRvalueExpression(*listExpr));
-        if (!value)
-          return {};
-        cond = moore::WildcardEqOp::create(builder, loc, lhs, value);
-      }
       conditions.push_back(cond);
     }
 
@@ -1775,9 +1734,6 @@ struct RvalueExprVisitor : public ExprVisitor {
     auto *lowering = context.declareFunction(*subroutine);
     if (!lowering)
       return {};
-    auto convertedFunction = context.convertFunction(*subroutine);
-    if (failed(convertedFunction))
-      return {};
 
     // Convert the call arguments. Input arguments are converted to an rvalue.
     // All other arguments are converted to lvalues and passed into the function
@@ -1810,53 +1766,18 @@ struct RvalueExprVisitor : public ExprVisitor {
       arguments.push_back(value);
     }
 
-    if (!lowering->isConverting && !lowering->captures.empty()) {
-      auto materializeCaptureAtCall = [&](Value cap) -> Value {
-        // Captures are expected to be moore::RefType.
-        auto refTy = dyn_cast<moore::RefType>(cap.getType());
-        if (!refTy) {
-          lowering->op.emitError(
-              "expected captured value to be moore::RefType");
-          return {};
-        }
-
-        // Expected case: the capture stems from a variable of any parent
-        // scope. We need to walk up, since definition might be a couple regions
-        // up.
-        Region *capRegion = [&]() -> Region * {
-          if (auto ba = dyn_cast<BlockArgument>(cap))
-            return ba.getOwner()->getParent();
-          if (auto *def = cap.getDefiningOp())
-            return def->getParentRegion();
-          return nullptr;
-        }();
-
-        Region *callRegion =
-            builder.getBlock() ? builder.getBlock()->getParent() : nullptr;
-
-        for (Region *r = callRegion; r; r = r->getParentRegion()) {
-          if (r == capRegion) {
-            // Safe to use the SSA value directly here.
-            return cap;
-          }
-        }
-
-        // Otherwise we can’t legally rematerialize this capture here.
-        lowering->op.emitError()
-            << "cannot materialize captured ref at call site; non-symbol "
-            << "source: "
-            << (cap.getDefiningOp()
-                    ? cap.getDefiningOp()->getName().getStringRef()
-                    : "<block-arg>");
+    // Pass captured variables as extra arguments. Each captured AST symbol is
+    // resolved to an MLIR value through the scoped symbol table, which
+    // naturally handles transitive captures (the caller’s own capture block
+    // argument will be found for variables captured from an outer scope).
+    for (auto *sym : lowering->capturedSymbols) {
+      Value val = context.valueSymbols.lookup(sym);
+      if (!val) {
+        mlir::emitError(loc) << "failed to resolve captured variable `"
+                             << sym->name << "` at call site";
         return {};
-      };
-
-      for (Value cap : lowering->captures) {
-        Value mat = materializeCaptureAtCall(cap);
-        if (!mat)
-          return {};
-        arguments.push_back(mat);
       }
+      arguments.push_back(val);
     }
 
     // Determine result types from the declared/converted func op.
@@ -2265,24 +2186,15 @@ struct RvalueExprVisitor : public ExprVisitor {
       if (const auto *subroutine =
               std::get_if<const slang::ast::SubroutineSymbol *>(
                   &callConstructor->subroutine)) {
-        // Bit paranoid, but virtually free checks that new is a class method
-        // and the subroutine has already been converted.
         if (!(*subroutine)->thisVar) {
-          mlir::emitError(loc) << "Expected subroutine called by new to use an "
-                                  "implicit this reference";
+          mlir::emitError(loc)
+              << "unsupported constructor call without `this` argument";
           return {};
         }
-        if (failed(context.convertFunction(**subroutine)))
-          return {};
         // Pass the newObj as the implicit this argument of the ctor.
-        auto savedThis = context.currentThisRef;
-        context.currentThisRef = newObj;
-        llvm::scope_exit restoreThis(
-            [&] { context.currentThisRef = savedThis; });
-        // Emit a call to ctor
+        llvm::SaveAndRestore saveThis(context.currentThisRef, newObj);
         if (!visitCall(*callConstructor, *subroutine))
           return {};
-        // Return new handle
         return newObj;
       }
     return {};
@@ -3340,4 +3252,58 @@ Context::getAncestorClassWithProperty(const moore::ClassHandleType &actualTy,
   // No ancestor declares that property.
   mlir::emitError(loc) << "unknown property `" << fieldName << "`";
   return {};
+}
+
+//===--------------------------------------------------------------------===//
+// Value Range Expression Methods
+//===--------------------------------------------------------------------===//
+
+Value Context::convertInsideCheck(Value insideLhs, Location loc,
+                                  const slang::ast::Expression &expr) {
+  // The value range list on the right-hand side of the inside operator is a
+  // comma-separated list of expressions or ranges.
+  if (const auto *valueRange = expr.as_if<slang::ast::ValueRangeExpression>()) {
+    auto lowBound =
+        convertToSimpleBitVector(convertRvalueExpression(valueRange->left()));
+    auto highBound =
+        convertToSimpleBitVector(convertRvalueExpression(valueRange->right()));
+    if (!insideLhs || !lowBound || !highBound)
+      return {};
+
+    Value rangeLhs, rangeRhs;
+    // Determine if the insideLhs on the left-hand side is inclusively
+    // within the range.
+    if (valueRange->left().type->isSigned() ||
+        insideLhs.getType().isSignedInteger()) {
+      rangeLhs = moore::SgeOp::create(builder, loc, insideLhs, lowBound);
+    } else {
+      rangeLhs = moore::UgeOp::create(builder, loc, insideLhs, lowBound);
+    }
+
+    if (valueRange->right().type->isSigned() ||
+        insideLhs.getType().isSignedInteger()) {
+      rangeRhs = moore::SleOp::create(builder, loc, insideLhs, highBound);
+    } else {
+      rangeRhs = moore::UleOp::create(builder, loc, insideLhs, highBound);
+    }
+
+    return moore::AndOp::create(builder, loc, rangeLhs, rangeRhs);
+  }
+
+  // Handle expressions.
+  if (!expr.type->isIntegral()) {
+    if (expr.type->isUnpackedArray()) {
+      mlir::emitError(loc,
+                      "unpacked arrays in 'inside' expressions not supported");
+      return {};
+    }
+    mlir::emitError(
+        loc, "only simple bit vectors supported in 'inside' expressions");
+    return {};
+  }
+
+  auto value = convertToSimpleBitVector(convertRvalueExpression(expr));
+  if (!value)
+    return {};
+  return moore::WildcardEqOp::create(builder, loc, insideLhs, value);
 }
