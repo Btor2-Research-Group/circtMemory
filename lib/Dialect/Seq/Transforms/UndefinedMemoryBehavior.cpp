@@ -40,10 +40,10 @@ struct HashMapInstances {
     /// Enables undefined memory behavior by randomly choosing what will occur with a input node.
 struct UndefinedMemoryBehaviorPass
     : public circt::seq::impl::UndefinedMemoryBehaviorBase<UndefinedMemoryBehaviorPass> {
-    void runOnOperation() override;   
-    }// namespace
+    void runOnOperation() override;
+};
 
-}
+} // namespace
 void UndefinedMemoryBehaviorPass::runOnOperation() {
     auto module = getOperation();
 
@@ -56,6 +56,7 @@ void UndefinedMemoryBehaviorPass::runOnOperation() {
         sramMap[sramResult].memOp = op;
 
         // Find all the read, write, and readwrite operations that are using this memory and add them to the hashmap at the same key
+        // Users vs Uses? 
         for (Operation *user : sramResult.getUsers()) {
             llvm::TypeSwitch<Operation *>(user)
                 .Case<seq::FirMemReadOp>([&](seq::FirMemReadOp readOp) {sramMap[sramResult].reads.push_back(readOp);})
@@ -69,19 +70,27 @@ void UndefinedMemoryBehaviorPass::runOnOperation() {
         HashMapInstances instance = object.second;
         auto readOps = instance.reads;
         auto writeOps = instance.writes;
+        auto readWriteOps = instance.readWrites;
         int randomCounter = 0;
 
         // If either list is empty we can return early
-        if (readOps.empty() || (writeOps.empty() && readWrites.empty())) {
+        if (readOps.empty() || (writeOps.empty() && readWriteOps.empty())) {
             continue;
         }
 
+        // Add the mutually exclusive check when you find a write or readWrite (before checking Enabled)
+        // With multiple writes (or reads) in the same cycle, you need to pick one that happens in this cycle and then
+        // buffer to store the writes and delay them for later cycles (check for a FIFO buffer operation)
+
+        // Use the FIRTL kevin pass with multiple writes in the same cycle, and see if it generates a buffer
+        // If it does then we need to implement above ^ 
+
         // Loop through all the read and write ports and check if they are accessing the same address
         for (auto readOp : readOps) {
-            ImplicitLocOpBuilder b(readOp.getLoc(), readOp);
+            ImplicitLocOpBuilder b(module.getLoc(), module.getBody());
             b.setInsertionPointAfter(readOp);
             // Maintain a list of the actual collisions that we can later use in the mux. 
-            SmallVector<Value, 4> collisionList;
+            SmallVector<Value, 16> collisionList;
 
             for (auto writeOp : writeOps) {
                 auto isSameAddress = b.create<comb::ICmpOp>(comb::ICmpPredicate::eq, readOp.getAddress(), writeOp.getAddress());
@@ -98,11 +107,11 @@ void UndefinedMemoryBehaviorPass::runOnOperation() {
             
             // Check the ReadWrite ports as well
             for (auto readWriteOp : readWriteOps) {
-                auto isSameAddress = b.create<comb::ICmpOp>(comb::ICmpPredicate::eq, readOp.getAddress(), readWriteOp.getAddress());
+                auto isSameAddress = b.createOrFold<comb::ICmpOp>(comb::ICmpPredicate::eq, readOp.getAddress(), readWriteOp.getAddress());
 
                 // If they are the same address, we need to ensure they are going to collide
                 Value readIsEnabled = readOp.getEnable();
-                Value writeIsEnabled = writeOp.getEnable();
+                Value writeIsEnabled = readWriteOp.getEnable();
                 Value readAndWriteEnabled = b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
                 Value isCollision = b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
 
@@ -115,11 +124,13 @@ void UndefinedMemoryBehaviorPass::runOnOperation() {
             }
 
             // Use createOrFold in case there is only one collision to avoid unnecessary logic
-            Value conflictTrue = b.createOrFold<comb::OrOp>(collisionList);
+            Value conflictTrue = b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
 
             // Create a random value to use for undefined behavior. We tell the solver to randomly choose a value. 
             std::string randomName = "randomValueForUndefinedBehavior" + std::to_string(randomCounter++);
-            auto randomPair = module.appendInput(randomName, readOp.getType());
+            auto randomPair = module.appendInput(b.getStringAttr(randomName), readOp.getType());
+            // Use symbolic value instead
+            Verif::SymbolicValue.op
             Value randomVal = randomPair.second;
 
             // If true, we have a read-write collision and we can enable undefined memory behavior
