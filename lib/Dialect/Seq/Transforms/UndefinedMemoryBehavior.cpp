@@ -14,6 +14,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "circt/Dialect/Verif/VerifOps.h"
 
 namespace circt {
 namespace seq {
@@ -49,7 +50,6 @@ public:
 } // namespace
 
 void UndefinedMemoryBehavior::runOnOperation() {
-  // The two for loop place to code
   auto module = getOperation();
 
     // Set up hashmap for the SRAM instances
@@ -61,7 +61,6 @@ void UndefinedMemoryBehavior::runOnOperation() {
         sramMap[sramResult].memOp = op;
 
         // Find all the read, write, and readwrite operations that are using this memory and add them to the hashmap at the same key
-        // Users vs Uses? 
         for (Operation *user : sramResult.getUsers()) {
             llvm::TypeSwitch<Operation *>(user)
                 .Case<seq::FirMemReadOp>([&](seq::FirMemReadOp readOp) {sramMap[sramResult].reads.push_back(readOp);})
@@ -82,13 +81,6 @@ void UndefinedMemoryBehavior::runOnOperation() {
         if (readOps.empty() || (writeOps.empty() && readWriteOps.empty())) {
             continue;
         }
-
-        // Add the mutually exclusive check when you find a write or readWrite (before checking Enabled)
-        // With multiple writes (or reads) in the same cycle, you need to pick one that happens in this cycle and then
-        // buffer to store the writes and delay them for later cycles (check for a FIFO buffer operation)
-
-        // Use the FIRTL kevin pass with multiple writes in the same cycle, and see if it generates a buffer
-        // If it does then we need to implement above ^ 
 
         // Loop through all the read and write ports and check if they are accessing the same address
         for (auto readOp : readOps) {
@@ -131,12 +123,10 @@ void UndefinedMemoryBehavior::runOnOperation() {
             // Use createOrFold in case there is only one collision to avoid unnecessary logic
             Value conflictTrue = b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
 
-            // Create a random value to use for undefined behavior. We tell the solver to randomly choose a value. 
+            // Create a symbolic value to use for undefined behavior so it's chosen at runtime
             std::string randomName = "randomValueForUndefinedBehavior" + std::to_string(randomCounter++);
-            auto randomPair = module.appendInput(b.getStringAttr(randomName), readOp.getType());
-            // Use symbolic value instead
-            Verif::SymbolicValue.op
-            Value randomVal = randomPair.second;
+            auto randomSymbolic = verif::SymbolicValueOp::create(b, readOp.getType(), b.getStringAttr(randomName));
+            Value randomVal = randomSymbolic.getResult();
 
             // If true, we have a read-write collision and we can enable undefined memory behavior
             // This mux chooses between the correct value and an undefined value based on whether there is a collision or not
