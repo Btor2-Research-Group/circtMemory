@@ -86,6 +86,30 @@ void UndefinedMemoryBehavior::runOnOperation() {
         for (auto readOp : readOps) {
             ImplicitLocOpBuilder b(module.getLoc(), module.getBody());
             b.setInsertionPointAfter(readOp);
+
+            // Out of Bounds checker
+            Value currentResult = readOp.getResult();
+            uint64_t depth = instance.memOp.getMemory().getType().getDepth();
+            if (depth > 0) {
+                Value addr = readOp.getAddress();
+                Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
+
+                // Hazard if: (Address >= Depth) which means we are out of bounds and can have undefined behavior
+                // Use a symbolic value so at runtime the value is chosen nondeterministically
+                Value isOutOfBounds = b.createOrFold<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
+
+                std::string oobName = "randomValueForOOB" + std::to_string(randomCounter++);
+                auto randomSymbolicOOB = verif::SymbolicValueOp::create(b, currentResult.getType(), b.getStringAttr(oobName));
+                Value randomOOBVal = randomSymbolicOOB.getResult();
+
+                Value muxForOOB = b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
+                Operation *muxOOBOp = muxForOOB.getDefiningOp();
+                currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
+
+                // Update currentResult so later logic uses the OOB-protected value.
+                currentResult = muxForOOB;
+            }
+
             // Maintain a list of the actual collisions that we can later use in the mux. 
             SmallVector<Value, 16> collisionList;
 
@@ -130,7 +154,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
             // If true, we have a read-write collision and we can enable undefined memory behavior
             // This mux chooses between the correct value and an undefined value based on whether there is a collision or not
-            Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, readOp.getResult());
+            // This also upholds the OOB and return the random OOB value if we are out of bounds regardless of collisions
+            Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentResult);
 
             Operation *muxOp = mux.getDefiningOp();
             readOp.getResult().replaceAllUsesExcept(mux, muxOp);
