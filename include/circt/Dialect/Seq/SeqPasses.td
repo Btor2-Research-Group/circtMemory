@@ -127,7 +127,7 @@ def RegOfVecToMem : Pass<"seq-reg-of-vec-to-mem", "hw::HWModuleOp"> {
   }];
 }
 
-
+// --undefined-memory-behavior 
 def UndefinedMemoryBehavior : Pass<"undefined-memory-behavior", "hw::HWModuleOp">{
     let summary = "Disambiguates undefined memory behavior";
     let description = [{
