@@ -17,6 +17,15 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
+
+// DO NOT NEED
+// #include "circt/Dialect/HW/HWTypes.h"
+// #include "circt/Dialect/Verif/VerifDialect.h"
+// #include "circt/Dialect/Verif/VerifPasses.h"
+// #include "circt/Dialect/LTL/LTLTypes.h"
+// #include "mlir/Transforms/DialectConversion.h"
+
+
 namespace circt {
 namespace seq {
 #define GEN_PASS_DEF_UNDEFINEDMEMORYBEHAVIOR
@@ -61,6 +70,11 @@ private:
 void UndefinedMemoryBehavior::runOnOperation() {
   auto module = getOperation();
 
+
+  MLIRContext &ctxt = getContext(); // Avery 6.23
+  ConversionTarget target(ctxt);    // Avery 6.23
+  target.addLegalDialect<seq::SeqDialect, hw::HWDialect, comb::CombDialect>(); // Avery 6.23
+
   // Set up hashmap for the SRAM instances
   // TODO : switch to
   // SmallDenseMap<Value, SmallDenseMap>
@@ -97,6 +111,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
   // TODO: Switch to OpBuilder
   // mlir::
   ImplicitLocOpBuilder b(module.getLoc(), module.getBody());
+  //OpBuilder b(module); // Avery 6/23/26, imitating combine assert like
 
   //----------------
   // Initialization complete.
@@ -108,11 +123,6 @@ void UndefinedMemoryBehavior::runOnOperation() {
     auto readOps = instance.reads;
     auto writeOps = instance.writes;
     auto readWriteOps = instance.readWrites;
-
-    // If either list is empty we can return early
-    if (readOps.empty() || (writeOps.empty() && readWriteOps.empty())) {
-      continue;
-    }
 
     // Loop through all the read and write ports and check if they are accessing
     // the same address
@@ -130,15 +140,15 @@ void UndefinedMemoryBehavior::runOnOperation() {
       if (depth > 0) {
         Value addr = readOp.getAddress();
         Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
-        
 
         // Hazard if: (Address >= Depth) which means we are out of bounds and
         // can have undefined behavior Use a symbolic value so at runtime the
         // value is chosen nondeterministically
-        Value isOutOfBounds = b.createOrFold<comb::ICmpOp>(
-            comb::ICmpPredicate::uge, addr, depthValue);
+        Value isOutOfBounds = b.create<comb::ICmpOp>(
+           comb::ICmpPredicate::uge, addr, depthValue);
+        //comb::ICmpOp isOutOfBounds = comb::ICmpOp::create(b, comb::ICmpPredicate::gt, addr, depthValue);
 
-        
+
         // Randomize if needed
         auto oobName = symbolNamespace.newName("randomValueForOOB");
 
@@ -151,22 +161,33 @@ void UndefinedMemoryBehavior::runOnOperation() {
             b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
         Operation *muxOOBOp = muxForOOB.getDefiningOp();
 
-          /*
-         Value muxForOOB =
-            b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
-        Operation *muxOOBOp = muxForOOB.getDefiningOp();
-        */
+        /*
+       Value muxForOOB =
+          b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
+      Operation *muxOOBOp = muxForOOB.getDefiningOp();
+      */
         currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
 
         // Update currentResult so later logic uses the OOB-protected value.
         currentResult = muxForOOB;
       }
 
+      // If either list is empty we can return early.
+      if (readOps.empty() || (writeOps.empty() && readWriteOps.empty())) {
+        continue;
+      }
       // Maintain a list of the actual collisions that we can later use in the
       // mux.
+
+      // -------------------------------------------------------------- //
+      // Check for read/write conflicts 
+
+
+
       SmallVector<Value, 16> collisionList;
 
       for (auto writeOp : writeOps) {
+
         auto isSameAddress = b.create<comb::ICmpOp>(
             comb::ICmpPredicate::eq, readOp.getAddress(), writeOp.getAddress());
 
@@ -185,7 +206,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       // Check the ReadWrite ports as well
       for (auto readWriteOp : readWriteOps) {
-        auto isSameAddress = b.createOrFold<comb::ICmpOp>(
+        auto isSameAddress = b.create<comb::ICmpOp>(
             comb::ICmpPredicate::eq, readOp.getAddress(),
             readWriteOp.getAddress());
 
@@ -206,9 +227,13 @@ void UndefinedMemoryBehavior::runOnOperation() {
         continue;
       }
 
-      // Use createOrFold in case there is only one collision to avoid
+      // Use createorFold in case there is only one collision to avoid
       // unnecessary logic
-      Value conflictTrue = b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
+      // Value conflictTrue =
+      // b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
+
+      Value conflictTrue = b.create<comb::OrOp>(mlir::ValueRange(collisionList),
+                                                false); // Avery, 6/14
 
       // Random name creation
       auto symbolicName =
@@ -286,73 +311,78 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       // Start at the write in the list AFTEr the current write, so no repeats.
       // TODO: how does this look?
-      auto startIt = llvm::find(writeOps, writeOp);
+      */
 
-      for (auto it = startIt; it != writeOps.end(); ++it) {
-        auto writeOp2 = *it;
-        auto isSameAddress =
-            b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
-                                   writeOp.getAddress(), writeOp2.getAddress());
+    // auto startIt = llvm::find(writeOps, writeOp);
 
-        // If they are the same address, we need to ensure they are going to
-        // collide
-        Value writeIsEnabled = writeOp.getEnable();
-        Value write2IsEnabled = writeOp2.getEnable();
-        Value bothWritesEnabled =
-            b.create<comb::AndOp>(writeIsEnabled, write2IsEnabled);
-        Value isCollision =
-            b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+    // for (auto it = writeOp; it != writeOps.end(); ++it) {
 
-        // Add this collision to the list of collisions for this write operation
-        collisionList.push_back(isCollision);
-      }
+    //   auto writeOp2 = *it;
+    //   auto isSameAddress =
+    //       b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
+    //                              writeOp.getAddress(),
+    //                              writeOp2.getAddress());
 
-      // Check the ReadWrite ports as well
-      for (auto readWriteOp : readWriteOps) {
-        auto isSameAddress = b.createOrFold<comb::ICmpOp>(
-            comb::ICmpPredicate::eq, readOp.getAddress(),
-            readWriteOp.getAddress());
+    /*
+// If they are the same address, we need to ensure they are going to
+// collide
+Value writeIsEnabled = writeOp.getEnable();
+Value write2IsEnabled = writeOp2.getEnable();
+Value bothWritesEnabled =
+b.create<comb::AndOp>(writeIsEnabled, write2IsEnabled);
+Value isCollision =
+b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
 
-        // If they are the same address, we need to ensure they are going to
-        // collide
-        Value readIsEnabled = readOp.getEnable();
-        Value writeIsEnabled = readWriteOp.getEnable();
-        Value readAndWriteEnabled =
-            b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
-        Value isCollision =
-            b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+// Add this collision to the list of collisions for this write operation
+collisionList.push_back(isCollision);
+}
 
-        // Add this collision to the list of collisions for this read operation
-        collisionList.push_back(isCollision);
-      }
+// Check the ReadWrite ports as well
+for (auto readWriteOp : readWriteOps) {
+auto isSameAddress = b.createOrFold<comb::ICmpOp>(
+comb::ICmpPredicate::eq, readOp.getAddress(),
+readWriteOp.getAddress());
 
-      if (collisionList.empty()) {
-        continue;
-      }
+// If they are the same address, we need to ensure they are going to
+// collide
+Value readIsEnabled = readOp.getEnable();
+Value writeIsEnabled = readWriteOp.getEnable();
+Value readAndWriteEnabled =
+b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
+Value isCollision =
+b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
 
-      // I'm not sure how we make a random "write" value. How do we write
-      // Use createOrFold in case there is only one collision to avoid
-      // unnecessary logic
-      Value conflictTrue =
-          b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
+// Add this collision to the list of collisions for this read operation
+collisionList.push_back(isCollision);
+}
 
-      // Random name creation
-      auto symbolicName =
-          symbolNamespace.newName("randomValueForUndefinedBehaviorWrite");
-      // Aka choice, but used differently in application
-      auto randomSymbolicName = verif::SymbolicValueOp::create(
-          b, currentResult.getType(), b.getStringAttr(symbolicName));
-      Value randomVal = randomSymbolicName.getResult();
+if (collisionList.empty()) {
+continue;
+}
 
-      // If true, we have a read-write collision and we can enable undefined
-      // memory behavior This mux chooses between the correct value and an
-      // undefined value based on whether there is a collision or not This also
-      // upholds the OOB and return the random OOB value if we are out of bounds
-      // regardless of collisions
-      Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentResult);
+// I'm not sure how we make a random "write" value. How do we write
+// Use createOrFold in case there is only one collision to avoid
+// unnecessary logic
+Value conflictTrue =
+b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
 
-      Operation *muxOp = mux.getDefiningOp();
-      writeOp.getResult().replaceAllUsesExcept(mux, muxOp);
-    } */
+// Random name creation
+auto symbolicName =
+symbolNamespace.newName("randomValueForUndefinedBehaviorWrite");
+// Aka choice, but used differently in application
+auto randomSymbolicName = verif::SymbolicValueOp::create(
+b, currentResult.getType(), b.getStringAttr(symbolicName));
+Value randomVal = randomSymbolicName.getResult();
+
+// If true, we have a read-write collision and we can enable undefined
+// memory behavior This mux chooses between the correct value and an
+// undefined value based on whether there is a collision or not This also
+// upholds the OOB and return the random OOB value if we are out of bounds
+// regardless of collisions
+Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentResult);
+
+Operation *muxOp = mux.getDefiningOp();
+writeOp.getResult().replaceAllUsesExcept(mux, muxOp);
+} */
   }
 }
