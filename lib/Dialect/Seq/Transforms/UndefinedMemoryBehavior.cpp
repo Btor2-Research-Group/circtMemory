@@ -17,14 +17,12 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
-
 // DO NOT NEED
 // #include "circt/Dialect/HW/HWTypes.h"
 // #include "circt/Dialect/Verif/VerifDialect.h"
 // #include "circt/Dialect/Verif/VerifPasses.h"
 // #include "circt/Dialect/LTL/LTLTypes.h"
 // #include "mlir/Transforms/DialectConversion.h"
-
 
 namespace circt {
 namespace seq {
@@ -70,10 +68,10 @@ private:
 void UndefinedMemoryBehavior::runOnOperation() {
   auto module = getOperation();
 
-
   MLIRContext &ctxt = getContext(); // Avery 6.23
   ConversionTarget target(ctxt);    // Avery 6.23
-  target.addLegalDialect<seq::SeqDialect, hw::HWDialect, comb::CombDialect>(); // Avery 6.23
+  target.addLegalDialect<seq::SeqDialect, hw::HWDialect,
+                         comb::CombDialect>(); // Avery 6.23
 
   // Set up hashmap for the SRAM instances
   // TODO : switch to
@@ -111,7 +109,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
   // TODO: Switch to OpBuilder
   // mlir::
   ImplicitLocOpBuilder b(module.getLoc(), module.getBody());
-  //OpBuilder b(module); // Avery 6/23/26, imitating combine assert like
+  // OpBuilder b(module); // Avery 6/23/26, imitating combine assert like
 
   //----------------
   // Initialization complete.
@@ -126,6 +124,10 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
     // Loop through all the read and write ports and check if they are accessing
     // the same address
+
+
+
+
     for (auto readOp : readOps) {
       // TODO: check
       b.setInsertionPointAfter(readOp);
@@ -136,6 +138,9 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // Width greater than supported?
       uint64_t depth = instance.memOp.getMemory().getType().getDepth();
 
+      llvm::SmallPtrSet<mlir::Operation*, 1> readExceptions;
+
+    
       // Check if empty.
       if (depth > 0) {
         Value addr = readOp.getAddress();
@@ -144,10 +149,10 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // Hazard if: (Address >= Depth) which means we are out of bounds and
         // can have undefined behavior Use a symbolic value so at runtime the
         // value is chosen nondeterministically
-        Value isOutOfBounds = b.create<comb::ICmpOp>(
-           comb::ICmpPredicate::uge, addr, depthValue);
-        //comb::ICmpOp isOutOfBounds = comb::ICmpOp::create(b, comb::ICmpPredicate::gt, addr, depthValue);
-
+        Value isOutOfBounds =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
+        // comb::ICmpOp isOutOfBounds = comb::ICmpOp::create(b,
+        // comb::ICmpPredicate::gt, addr, depthValue);
 
         // Randomize if needed
         auto oobName = symbolNamespace.newName("randomValueForOOB");
@@ -159,17 +164,17 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         Value muxForOOB =
             b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
-        Operation *muxOOBOp = muxForOOB.getDefiningOp();
 
-        /*
-       Value muxForOOB =
-          b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
-      Operation *muxOOBOp = muxForOOB.getDefiningOp();
-      */
-        currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
+       
+
+        Operation *muxOOBOp = muxForOOB.getDefiningOp(); //Avery 6/27
+
+        readExceptions.insert(muxOOBOp);
+        currentResult.replaceAllUsesExcept(muxForOOB, readExceptions); //Avery 6/27
 
         // Update currentResult so later logic uses the OOB-protected value.
         currentResult = muxForOOB;
+        //readExceptions.insert(muxForOOB);
       }
 
       // If either list is empty we can return early.
@@ -179,10 +184,11 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // Maintain a list of the actual collisions that we can later use in the
       // mux.
 
+      // APPEND THE CURRENT RESULT TO THE
+
       // -------------------------------------------------------------- //
-      // Check for read/write conflicts 
-
-
+      // Check for read/write conflicts
+    
 
       SmallVector<Value, 16> collisionList;
 
@@ -206,16 +212,19 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       // Check the ReadWrite ports as well
       for (auto readWriteOp : readWriteOps) {
-        auto isSameAddress = b.create<comb::ICmpOp>(
-            comb::ICmpPredicate::eq, readOp.getAddress(),
-            readWriteOp.getAddress());
+        auto isSameAddress =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::eq, readOp.getAddress(),
+                                   readWriteOp.getAddress());
 
         // If they are the same address, we need to ensure they are going to
         // collide
         Value readIsEnabled = readOp.getEnable();
+        Value writeModeIsEnabled = readWriteOp.getMode(); // Avery 6/27
         Value writeIsEnabled = readWriteOp.getEnable();
+        Value readWrite_ActiveWrite =
+            b.create<comb::AndOp>(writeModeIsEnabled, writeIsEnabled);
         Value readAndWriteEnabled =
-            b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
+            b.create<comb::AndOp>(readIsEnabled, readWrite_ActiveWrite);
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
 
@@ -251,7 +260,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
       Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentResult);
 
       Operation *muxOp = mux.getDefiningOp();
-      readOp.getResult().replaceAllUsesExcept(mux, muxOp);
+      readExceptions.insert(muxOp);
+      readOp.getResult().replaceAllUsesExcept(mux, readExceptions);
     }
 
     // Write-Write Conflict: go through all the writes, see if they are the same
