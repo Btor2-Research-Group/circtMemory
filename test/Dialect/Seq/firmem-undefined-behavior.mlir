@@ -34,36 +34,44 @@
 
 
 // Read, Read Write Both Enabled
+// WORKS
 //------
 
-// CHECK-LABEL : hw.module @Read_ReadWriteConflict_BothEnabled
-// CHECK-NEXT : [[ENABLE:%.+]] = hw.constant true 
-// CHECK-NEXT : [[MODE:%.+]] = hw.constant true
-// CHECK-NEXT : [[ADDR:%.+]] = hw.constant 6 : i4
-// CHECK-NEXT : %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
-// CHECK-NEXT : [[READ:%.+]] = seq.firmem.read_port %mem[[[ADDR]]], clock %clock enable [[ENABLE]] : <12 x 20>
-// CHECK-NEXT : [[WRITE:%.+]] = seq.firmem.read_write_port %mem[[[ADDR]]] = %data, clock %clock enable [[ENABLE]] : <12 x 20>
-// CHECK-NEXT : [[TMP0:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4 
-// CHECK-NEXT : [[TMP1:%.+]] = comb.and [[MODE]], [[ENABLE]] : i1
-// CHECK-NEXT : [[TMP2:%.+]] = comb.and  [[ENABLE]], [[TMP1]] : i1 
-// CHECK-NEXT : [[TMP3:%.+]] = comb.and [[TMP0]], [[TMP2]] : i1 
-// CHECK-NEXT : [[TMP4:%.+]] = comb.or [[TMP3]], FALSE : i1
-// CHECK-NEXT : [[TMP5:%.+]] = verif.symbolic_value : i20
-// CHECK-NEXT : [[TMP6:%.+]] = comb.mux [[TMP4]], [[TMP5]], [[READ]] : i4
-// Check that the output mux is controlled by a conflict, and is between the random and intended read
-// CHECK-NEXT : hw.output [[TMP4]] : i20
-// CHECK-NEXT : }
-// hw.module @Read_ReadWriteConflict_BothEnabled(in %data: i20, in %clock: !seq.clock, out z: i20) {
-//  %enable = hw.constant true // Set to constant 1
-//  %mode = hw.constant true // Set the ReadWrite to writing
-//  %addr = hw.constant 6 : i4
-//  %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
+// CHECK-LABEL: hw.module @Read_ReadWriteConflict_BothEnabled
+// CHECK-NEXT: [[ENABLE:%.+]] = hw.constant true 
+// CHECK-NEXT: [[MODE:%.+]] = hw.constant true
+// CHECK-NEXT: [[ADDR:%.+]] = hw.constant 6 : i4
+// CHECK-NEXT: %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
+// CHECK-NEXT: [[READ:%.+]] = seq.firmem.read_port %mem[[[ADDR]]], clock %clock enable [[ENABLE]] : <12 x 20>
+// CHECK-NEXT: [[TMP0:%.+]] = hw.constant -4 : i4
+// CHECK-NEXT: [[TMP1:%.+]] = comb.icmp uge [[ADDR]], [[TMP0]] : i4
+// CHECK-NEXT: [[TMP2:%.+]] = verif.symbolic_value : i20
+// CHECK-NEXT: [[TMP3:%.+]] = comb.mux [[TMP1]], [[TMP2]], [[READ]] : i20
+// Read write
+// CHECK-NEXT: [[TMP4:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4 
+// Is the Read-Write Enabled/In write mode?
+// CHECK-NEXT: [[TMP5:%.+]] = comb.and [[MODE]], [[ENABLE]] : i1 
+// Are both Enabled?
+// CHECK-NEXT: [[TMP6:%.+]] = comb.and [[ENABLE]], [[TMP5]] : i1 
+// Are they the same addr & enabled?
+// CHECK-NEXT: [[TMP7:%.+]] = comb.and [[TMP4]], [[TMP6]] : i1 
+// CHECK-NEXT: [[TMP8:%.+]] = comb.or [[TMP7]] : i1
+// CHECK-NEXT: [[TMP9:%.+]] = verif.symbolic_value : i20
+// CHECK-NEXT: [[TMP10:%.+]] = comb.mux [[TMP8]], [[TMP9]], [[TMP3]] : i20
+// CHECK-NEXT: [[WRITE:%.+]] = seq.firmem.read_write_port %mem[[[ADDR]]] = %data if [[MODE]], clock %clock enable [[ENABLE]] : <12 x 20>
+// CHECK-NEXT: hw.output [[TMP10]] : i20
+// CHECK-NEXT: }
+hw.module @Read_ReadWriteConflict_BothEnabled(in %data: i20, in %clock: !seq.clock, out z: i20) {
+ %enable = hw.constant true // Set to constant 1
+ %mode = hw.constant true // Set the ReadWrite to writing
+ %addr = hw.constant 6 : i4
+ %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
 
-//  %0 = seq.firmem.read_port %mem[%addr], clock %clock enable %enable: <12 x 20>
-//  %1 = seq.firmem.read_write_port %mem[%addr] = %data if %mode, clock %clock enable %enable: <12 x 20>
+ %0 = seq.firmem.read_port %mem[%addr], clock %clock enable %enable: <12 x 20>
+ %1 = seq.firmem.read_write_port %mem[%addr] = %data if %mode, clock %clock enable %enable: <12 x 20>
 
-//  hw.output %0 : i20
-// }
+ hw.output %0 : i20
+}
 
 
 
