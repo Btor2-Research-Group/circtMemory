@@ -318,6 +318,74 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
 
 
+    // Check Write-WRite Conflicts
+
+
+
+
+
+
+    for (auto writeOp : writeOps) {
+      b.setInsertionPoint(writeOp);
+
+
+      // Check OOB
+      // Out of Bounds checker
+  
+      Value writeIsEnabled = writeOp.getEnable();
+
+      Value currentEnable = writeIsEnabled;
+      // Width of the address?
+      // Width greater than supported?
+      uint64_t depth = instance.memOp.getMemory().getType().getDepth();
+
+      // Store the exceptions list (to make the MLIR clear to check)
+      llvm::SmallPtrSet<mlir::Operation*, 1> writeExceptions;
+
+      // Value readEnable = readOp.getEnable();
+       
+
+
+      Value muxForOOB;
+      // Check if empty.
+      if (depth > 0) {
+        Value addr = writeOp.getAddress();
+        Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
+
+        // Hazard if: (Address >= Depth) which means we are out of bounds and
+        // can have undefined behavior Use a symbolic value so at runtime the
+        // value is chosen nondeterministically
+        Value isOutOfBounds =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
+        
+        // Negate
+        Value not_OOB = b.create<comb::ParityOp>(isOutOfBounds);
+
+        Value write_enabled =
+            b.create<comb::AndOp>(not_OOB, writeIsEnabled);
+       
+
+        Operation *enableOP = write_enabled.getDefiningOp(); //Avery 6/27
+
+       
+        // If out of bounds, random value is the only state needed for 
+        //
+       
+        currentEnable.replaceAllUsesExcept(write_enabled, enableOP); 
+        // Update currentResult so later logic uses the OOB-protected value.
+        currentEnable = write_enabled;
+        //readExceptions.insert(muxForOOB);
+      }
+
+
+
+
+
+
+      // Iterate through remaining write ports and 
+      // check for conflict.
+
+    }
 
 
 
@@ -327,14 +395,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
 
 
-
-
-
-
-
-
-
-
+    
 
 
 
