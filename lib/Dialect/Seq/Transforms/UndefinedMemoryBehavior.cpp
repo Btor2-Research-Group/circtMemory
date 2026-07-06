@@ -220,7 +220,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
       for (auto writeOp : writeOps) {
 
         b.setInsertionPointAfter(writeOp);
-        
+
         auto isSameAddress = b.create<comb::ICmpOp>(
             comb::ICmpPredicate::eq, readOp.getAddress(), writeOp.getAddress());
 
@@ -242,6 +242,9 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       // Check the ReadWrite ports as well
       for (auto readWriteOp : readWriteOps) {
+
+         b.setInsertionPointAfter(readWriteOp);
+
         auto isSameAddress =
             b.create<comb::ICmpOp>(comb::ICmpPredicate::eq, readOp.getAddress(),
                                    readWriteOp.getAddress());
@@ -382,6 +385,64 @@ void UndefinedMemoryBehavior::runOnOperation() {
         //readExceptions.insert(muxForOOB);
       }
 
+      // Check for Write-Write Conflicts
+
+       auto startIt = llvm::find(writeOps, writeOp);
+       auto it = startIt +1;
+      for (; it != writeOps.end(); it++) {
+        // Create the WriteOp2
+        auto writeOp2 = *it;
+
+        // Check for a Conflict
+        auto isSameAddress =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
+                                  writeOp.getAddress(),
+                                  writeOp2.getAddress());
+        
+        // If they are the same address, we need to ensure they are going to
+        // collide
+        Value write2IsEnabled = writeOp2.getEnable();
+        Value bothWritesEnabled =
+            b.create<comb::AndOp>(currentEnable, write2IsEnabled);
+        Value isCollision =
+            b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+      }
+
+
+
+
+
+
+      // Skip the Read Writes if there are no others.
+      if (readWriteOps.empty()) {
+        continue;
+      }
+
+      
+
+      for (auto readWriteOp : readWriteOps){
+
+        // Check for a Conflict
+        auto isSameAddress =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
+                                  writeOp.getAddress(),
+                                  readWriteOp.getAddress());
+        
+        // If they are the same address, we need to ensure they are going to
+        // collide
+        Value readWrite_WriteConflict_valid = b.create<comb::AndOp>(readWriteOp.getEnable(), readWriteOp.getMode());
+        Value bothWritesEnabled =
+            b.create<comb::AndOp>(currentEnable, readWrite_WriteConflict_valid);
+        Value isWriteCollision =
+            b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+
+
+        Value invertMode = b.create<comb::ParityOp>(readWriteOp.getMode()); // 1 if READ now
+        Value readWrite_Read_Conflict_valid = b.create<comb::AndOp>(readWriteOp.getEnable(), invertMode);
+        Value isRWCollision =
+            b.create<comb::AndOp>(isSameAddress, readWrite_Read_Conflict_valid);
+      }
+
 
 
 
@@ -399,6 +460,108 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
 
 
+    for (auto readWriteOp : readWriteOps) {
+      b.setInsertionPoint(readWriteOp);
+
+      
+      // Check OOB
+      // Out of Bounds checker
+  
+      Value rwIsEnabled = readWriteOp.getEnable();
+
+      Value currentEnable = rwIsEnabled;
+      // Width of the address?
+      // Width greater than supported?
+      uint64_t depth = instance.memOp.getMemory().getType().getDepth();
+
+      // Store the exceptions list (to make the MLIR clear to check)
+      llvm::SmallPtrSet<mlir::Operation*, 1> readOOBExceptions;
+      llvm::SmallPtrSet<mlir::Operation*, 1> writeOOBExceptions;
+      // Value readEnable = readOp.getEnable();
+       Value currentResult = readWriteOp.getResult();
+       Value muxForOOB;
+
+      // Check if empty.
+      if (depth > 0) {
+        Value addr = readWriteOp.getAddress();
+        Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
+
+        // Hazard if: (Address >= Depth) which means we are out of bounds and
+        // can have undefined behavior Use a symbolic value so at runtime the
+        // value is chosen nondeterministically
+        Value isOutOfBounds =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
+      
+        // Writing Out of Bounds: disable
+        // Negate
+        Value not_OOB = b.create<comb::ParityOp>(isOutOfBounds);
+        Value write_mode_and_enabled = b.create<comb::AndOp>(rwIsEnabled, readWriteOp.getMode());
+        writeOOBExceptions.insert(write_mode_and_enabled.getDefiningOp());
+        Value write_enabled =
+            b.create<comb::AndOp>(not_OOB, write_mode_and_enabled);
+        
+        readWriteOp.getEnableMutable().assign(write_enabled); // Update all
+
+        Operation *enableOP = write_enabled.getDefiningOp(); 
+        writeOOBExceptions.insert(enableOP);
+        currentEnable.replaceAllUsesExcept(write_enabled, writeOOBExceptions); 
+        currentEnable = write_enabled;
+
+        // Reading Out of Bounds
+
+        // Randomize if needed
+        b.setInsertionPointAfter(readWriteOp);
+
+        auto oobName = symbolNamespace.newName("randomValueForOOB");
+
+        // Aka choice, but used differently in application
+        auto randomSymbolicOOB = verif::SymbolicValueOp::create(
+            b, currentResult.getType(), b.getStringAttr(oobName));
+        Value randomOOBVal = randomSymbolicOOB.getResult();
+
+        Value oob_readMode = b.create<comb::AndOp>(isOutOfBounds, readWriteOp.getMode());
+        
+        Value muxForOOB =
+            b.create<comb::MuxOp>(oob_readMode, randomOOBVal, currentResult);
+
+        
+         
+        currentResult.replaceAllUsesExcept(muxForOOB, muxForOOB.getDefiningOp()); 
+        // Update currentResult so later logic uses the OOB-protected value.
+        currentResult = muxForOOB;
+      }
+
+      b.setInsertionPoint(readWriteOp);
+
+
+
+      // Iterate through remaining RW ports and 
+      // check for conflict.
+
+      for (auto readWriteOp : readWriteOps){
+
+        // Check for a Conflict
+        auto isSameAddress =
+            b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
+                                  writeOp.getAddress(),
+                                  readWriteOp.getAddress());
+        
+        // If they are the same address, we need to ensure they are going to
+        // collide
+        Value readWrite_WriteConflict_valid = b.create<comb::AndOp>(readWriteOp.getEnable(), readWriteOp.getMode());
+        Value bothWritesEnabled =
+            b.create<comb::AndOp>(currentEnable, readWrite_WriteConflict_valid);
+        Value isWriteCollision =
+            b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+
+
+        Value invertMode = b.create<comb::ParityOp>(readWriteOp.getMode()); // 1 if READ now
+        Value readWrite_Read_Conflict_valid = b.create<comb::AndOp>(readWriteOp.getEnable(), invertMode);
+        Value isRWCollision =
+            b.create<comb::AndOp>(isSameAddress, readWrite_Read_Conflict_valid);
+      }
+
+    }
 
     
 
