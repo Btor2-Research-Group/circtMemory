@@ -126,9 +126,10 @@ void UndefinedMemoryBehavior::runOnOperation() {
     // the same address
 
 
-
+    
 
     for (auto readOp : readOps) {
+
       // TODO: check
       b.setInsertionPointAfter(readOp);
 
@@ -140,6 +141,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       llvm::SmallPtrSet<mlir::Operation*, 1> readExceptions;
 
+      
       // Value readEnable = readOp.getEnable();
        
 
@@ -217,6 +219,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
 //Value writeData = writeOp.getData();
       for (auto writeOp : writeOps) {
 
+        b.setInsertionPointAfter(writeOp);
+        
         auto isSameAddress = b.create<comb::ICmpOp>(
             comb::ICmpPredicate::eq, readOp.getAddress(), writeOp.getAddress());
 
@@ -364,13 +368,14 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value write_enabled =
             b.create<comb::AndOp>(not_OOB, writeIsEnabled);
        
-
+        writeOp.getEnableMutable().assign(write_enabled);
         Operation *enableOP = write_enabled.getDefiningOp(); //Avery 6/27
 
        
         // If out of bounds, random value is the only state needed for 
         //
        
+        //enableExceptions.insert(enableOP);
         currentEnable.replaceAllUsesExcept(write_enabled, enableOP); 
         // Update currentResult so later logic uses the OOB-protected value.
         currentEnable = write_enabled;
