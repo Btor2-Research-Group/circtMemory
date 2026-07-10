@@ -293,6 +293,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
     // Write-Op conficts
     // Write-Write Collisions are covered
 
+    // Store the exceptions list (to make the MLIR clear to check)
+  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     for (auto writeOp : writeOps) {
       b.setInsertionPoint(writeOp);
 
@@ -306,8 +308,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // Width greater than supported?
       uint64_t depth = instance.memOp.getMemory().getType().getDepth();
 
-      // Store the exceptions list (to make the MLIR clear to check)
-      llvm::SmallPtrSet<mlir::Operation *, 1> writeExceptions;
+
 
       // Value readEnable = readOp.getEnable();
 
@@ -437,12 +438,12 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // mux : CONFLICT? random, else data
 
       Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentData);
-      Operation *muxOp = mux.getDefiningOp();
-      currentData.replaceAllUsesExcept(mux, muxOp);
-
+      writeOp.getDataMutable().set(mux);
       // 7.6 ^
     }
 
+
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Read-Write Collisions Covered
     for (auto readWriteOp : readWriteOps) {
       b.setInsertionPoint(readWriteOp);
@@ -475,6 +476,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
       Value currentResult = readWriteOp.getResult();
 
       Value muxForOOB;
+
+      Operation * organizationOp;
       // Check if empty.
       if (depth > 0) {
 
@@ -504,6 +507,9 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // If out of bounds, random value is the only state needed for
         //
 
+
+         b.setInsertionPointAfter(readWriteOp);
+
         // Read OOB Check
         // Randomize if needed
         auto oobName = symbolNamespace.newName("randomValueForOOB");
@@ -520,14 +526,18 @@ void UndefinedMemoryBehavior::runOnOperation() {
                                           currentResult);
 
         Operation *muxOOBOp = muxForOOB.getDefiningOp(); // Avery 6/27
-
+        organizationOp = muxOOBOp;
         // readExceptions.insert(muxOOBOp);
         //  If out of bounds, random value is the only state needed for
         //
 
+
+        
+         // TODO
         currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
         // Update currentResult so later logic uses the OOB-protected value.
         currentResult = muxForOOB;
+        b.setInsertionPoint(readWriteOp);
         // readExceptions.insert(muxForOOB);
       }
 
@@ -628,13 +638,23 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // mux : CONFLICT? random, else data
 
         Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentData);
-        Operation *muxOp = mux.getDefiningOp();
-        currentData.replaceAllUsesExcept(mux, muxOp);
 
+        readWriteOp.getWriteDataMutable().set(mux);
+
+        //Operation *muxOp = mux.getDefiningOp();
+        //currentData.replaceAllUsesExcept(mux, muxOp);
         // 7.6 ^
       }
       if (!readCollisionList.empty()) {
 
+
+        if (organizationOp) {
+            b.setInsertionPointAfter(organizationOp);
+          } else {
+            b.setInsertionPointAfter(readWriteOp);
+        }
+        
+        // b.setInsertionPointToEnd(readWriteOp->getBlock());
         // Read Collision
 
         Value conflictTrue =
@@ -670,240 +690,5 @@ void UndefinedMemoryBehavior::runOnOperation() {
       }
     }
 
-    // for (auto readWriteOp : readWriteOps) {
-    //   b.setInsertionPoint(readWriteOp);
-
-    //   // Check OOB
-    //   // Out of Bounds checker
-
-    //   Value rwIsEnabled = readWriteOp.getEnable();
-
-    //   Value currentEnable = rwIsEnabled;
-    //   // Width of the address?
-    //   // Width greater than supported?
-    //   uint64_t depth = instance.memOp.getMemory().getType().getDepth();
-
-    //   // Store the exceptions list (to make the MLIR clear to check)
-    //   llvm::SmallPtrSet<mlir::Operation*, 1> readOOBExceptions;
-    //   llvm::SmallPtrSet<mlir::Operation*, 1> writeOOBExceptions;
-    //   // Value readEnable = readOp.getEnable();
-    //    Value currentResult = readWriteOp.getResult();
-    //    Value muxForOOB;
-
-    //   // Check if empty.
-    //   if (depth > 0) {
-    //     Value addr = readWriteOp.getAddress();
-    //     Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
-
-    //     // Hazard if: (Address >= Depth) which means we are out of bounds and
-    //     // can have undefined behavior Use a symbolic value so at runtime the
-    //     // value is chosen nondeterministically
-    //     Value isOutOfBounds =
-    //         b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr,
-    //         depthValue);
-
-    //     // Writing Out of Bounds: disable
-    //     // Negate
-    //     Value not_OOB = b.create<comb::ParityOp>(isOutOfBounds);
-    //     Value write_mode_and_enabled = b.create<comb::AndOp>(rwIsEnabled,
-    //     readWriteOp.getMode());
-    //     writeOOBExceptions.insert(write_mode_and_enabled.getDefiningOp());
-    //     Value write_enabled =
-    //         b.create<comb::AndOp>(not_OOB, write_mode_and_enabled);
-
-    //     readWriteOp.getEnableMutable().assign(write_enabled); // Update all
-
-    //     Operation *enableOP = write_enabled.getDefiningOp();
-    //     writeOOBExceptions.insert(enableOP);
-    //     currentEnable.replaceAllUsesExcept(write_enabled,
-    //     writeOOBExceptions); currentEnable = write_enabled;
-
-    //     // Reading Out of Bounds
-
-    //     // Randomize if needed
-    //     b.setInsertionPointAfter(readWriteOp);
-
-    //     auto oobName = symbolNamespace.newName("randomValueForOOB");
-
-    //     // Aka choice, but used differently in application
-    //     auto randomSymbolicOOB = verif::SymbolicValueOp::create(
-    //         b, currentResult.getType(), b.getStringAttr(oobName));
-    //     Value randomOOBVal = randomSymbolicOOB.getResult();
-
-    //     Value oob_readMode = b.create<comb::AndOp>(isOutOfBounds,
-    //     readWriteOp.getMode());
-
-    //     Value muxForOOB =
-    //         b.create<comb::MuxOp>(oob_readMode, randomOOBVal, currentResult);
-
-    //     currentResult.replaceAllUsesExcept(muxForOOB,
-    //     muxForOOB.getDefiningOp());
-    //     // Update currentResult so later logic uses the OOB-protected value.
-    //     currentResult = muxForOOB;
-    //   }
-
-    //   b.setInsertionPoint(readWriteOp);
-
-    // Iterate through remaining RW ports and
-    // check for conflict.
-
-    // for (auto readWriteOp : readWriteOps){
-
-    // Check for a Conflict
-    //   auto isSameAddress =
-    //       b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
-    //                             writeOp.getAddress(),
-    //                             readWriteOp.getAddress());
-
-    //   // If they are the same address, we need to ensure they are going to
-    //   // collide
-    //   Value readWrite_WriteConflict_valid =
-    //   b.create<comb::AndOp>(readWriteOp.getEnable(), readWriteOp.getMode());
-    //   Value bothWritesEnabled =
-    //       b.create<comb::AndOp>(currentEnable,
-    //       readWrite_WriteConflict_valid);
-    //   Value isWriteCollision =
-    //       b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
-
-    //   Value invertMode = b.create<comb::ParityOp>(readWriteOp.getMode()); //
-    //   1 if READ now Value readWrite_Read_Conflict_valid =
-    //   b.create<comb::AndOp>(readWriteOp.getEnable(), invertMode); Value
-    //   isRWCollision =
-    //       b.create<comb::AndOp>(isSameAddress,
-    //       readWrite_Read_Conflict_valid);
-    // }
-
-    //}
-
-    // Write-Write Conflict: go through all the writes, see if they are the same
-    // address
-
-    // Loop through all the read and write ports and check if they are accessing
-    // the same address
-
-    /*
-    for (auto writeOp : writeOps) {
-      ImplicitLocOpBuilder b(module.getLoc(), module.getBody());
-      b.setInsertionPointAfter(writeOp);
-
-      // Out of Bounds checker
-      Value currentResult = writeOp.getResult();
-      // Width of the address?
-      // Width greater than supported?
-      uint64_t depth = instance.memOp.getMemory().getType().getDepth();
-
-      // Check if incorrect address
-
-      // I don't think this is needed for writeOp
-      // however, I think it is important to check if it is out of bounds writes
-      // but what do we do then?
-      // TODO
-
-      if (depth > 0) {
-        Value addr = writeOp.getAddress();
-        Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
-
-        // Hazard if: (Address >= Depth) which means we are out of bounds and
-        // can have undefined behavior Use a symbolic value so at runtime the
-        // value is chosen nondeterministically
-        Value isOutOfBounds = b.createOrFold<comb::ICmpOp>(
-            comb::ICmpPredicate::uge, addr, depthValue);
-
-        // Randomize if needed
-        auto oobName = symbolNamespace.newName("randomValueForOOBWrite");
-
-        // Aka choice, but used differently in application
-        auto randomSymbolicOOB = verif::SymbolicValueOp::create(
-            b, currentResult.getType(), b.getStringAttr(oobName));
-        Value randomOOBVal = randomSymbolicOOB.getResult();
-
-        Value muxForOOB =
-            b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
-        Operation *muxOOBOp = muxForOOB.getDefiningOp();
-        currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
-
-        // Update currentResult so later logic uses the OOB-protected value.
-        currentResult = muxForOOB;
-      }
-
-      // Maintain a list of the actual collisions that we can later use in the
-      // mux.
-      SmallVector<Value, 16> collisionList;
-
-      // Start at the write in the list AFTEr the current write, so no repeats.
-      // TODO: how does this look?
-      */
-
-    // auto startIt = llvm::find(writeOps, writeOp);
-
-    // for (auto it = writeOp; it != writeOps.end(); ++it) {
-
-    //   auto writeOp2 = *it;
-    //   auto isSameAddress =
-    //       b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
-    //                              writeOp.getAddress(),
-    //                              writeOp2.getAddress());
-
-    /*
-// If they are the same address, we need to ensure they are going to
-// collide
-Value writeIsEnabled = writeOp.getEnable();
-Value write2IsEnabled = writeOp2.getEnable();
-Value bothWritesEnabled =
-b.create<comb::AndOp>(writeIsEnabled, write2IsEnabled);
-Value isCollision =
-b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
-
-// Add this collision to the list of collisions for this write operation
-collisionList.push_back(isCollision);
-}
-
-// Check the ReadWrite ports as well
-for (auto readWriteOp : readWriteOps) {
-auto isSameAddress = b.createOrFold<comb::ICmpOp>(
-comb::ICmpPredicate::eq, readOp.getAddress(),
-readWriteOp.getAddress());
-
-// If they are the same address, we need to ensure they are going to
-// collide
-Value readIsEnabled = readOp.getEnable();
-Value writeIsEnabled = readWriteOp.getEnable();
-Value readAndWriteEnabled =
-b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
-Value isCollision =
-b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
-
-// Add this collision to the list of collisions for this read operation
-collisionList.push_back(isCollision);
-}
-
-if (collisionList.empty()) {
-continue;
-}
-
-// I'm not sure how we make a random "write" value. How do we write
-// Use createOrFold in case there is only one collision to avoid
-// unnecessary logic
-Value conflictTrue =
-b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
-
-// Random name creation
-auto symbolicName =
-symbolNamespace.newName("randomValueForUndefinedBehaviorWrite");
-// Aka choice, but used differently in application
-auto randomSymbolicName = verif::SymbolicValueOp::create(
-b, currentResult.getType(), b.getStringAttr(symbolicName));
-Value randomVal = randomSymbolicName.getResult();
-
-// If true, we have a read-write collision and we can enable undefined
-// memory behavior This mux chooses between the correct value and an
-// undefined value based on whether there is a collision or not This also
-// upholds the OOB and return the random OOB value if we are out of bounds
-// regardless of collisions
-Value mux = b.create<comb::MuxOp>(conflictTrue, randomVal, currentResult);
-
-Operation *muxOp = mux.getDefiningOp();
-writeOp.getResult().replaceAllUsesExcept(mux, muxOp);
-} */
   }
 }
