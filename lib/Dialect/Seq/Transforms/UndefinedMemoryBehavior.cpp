@@ -302,6 +302,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // Out of Bounds checker
 
       Value writeIsEnabled = writeOp.getEnable();
+      // TODO: MAKE A HW CONSTANT IF NO EXIST, WRITEISENABLED = TRUE
 
       Value currentEnable = writeIsEnabled;
       // Width of the address?
@@ -336,6 +337,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value not_OOB = b.create<comb::XorOp>(isOutOfBounds,
                                               constantTrue); // ADD TO MLIR 7/6
 
+                                              // TODO: CHECK IF ENABLE EXISTS. OTHERWISE< JUST SET IT TO NOT_OOB
         Value write_enabled = b.create<comb::AndOp>(not_OOB, writeIsEnabled);
 
         // writeOp.getEnableMutable().assign(write_enabled);
