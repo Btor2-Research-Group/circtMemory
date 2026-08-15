@@ -552,7 +552,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
 
         // Hazard if: (Address >= Depth) which means we are out of bounds and
-        // can have undefined behavior Use a symbolic value so at runtime the
+        // can have undefined behavior  a symbolic value so at runtime the
         // value is chosen nondeterministically
         Value isOutOfBounds =
             b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
@@ -623,7 +623,9 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // If they are the same address, we need to ensure they are going to
         // collide
         Value writeOpIsEnabled = writeOp.getEnable();
-        if (!writeOpIsEnabled) { // No enable exists. Assume enabled.
+
+        // No write enable was used when instantiating the port. Assume enabled.
+        if (!writeOpIsEnabled) {
           Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
           writeOpIsEnabled = writeTrue;
         }
@@ -632,13 +634,23 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
 
+      
         if (lastOp->isBeforeInBlock(writeOp)) {
           lastCommand = isCollision.getDefiningOp();
           lastOp = writeOp;
         }
 
         collisionList.push_back(isCollision);
-        // TODO: 7/6 Add garbage to both %data.
+
+        // TODO: What about a read collision here? // 8/15
+        // Read Write is a Read, and both are enabled
+        Value readAndWriteEnabled =
+            b.create<comb::AndOp>(readIsEnabled, writeOpIsEnabled);
+        Value isReadCollision =
+            b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+        //8/15: WHY NOT WHAT
+        // Add this collision to the list of collisions for this read operation
+        readCollisionList.push_back(isReadCollision);
       }
 
       for (auto readWriteOp2 : readWriteOps) {

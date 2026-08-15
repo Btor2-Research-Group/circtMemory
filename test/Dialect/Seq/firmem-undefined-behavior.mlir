@@ -687,13 +687,13 @@
 //
 
 
-//Test Case
-  hw.module @ReadWriteSmem(in %clock : !seq.clock, in %reset : i1, in %io_enable : i1, in %io_write : i1, in %io_addr : i10, in %io_dataIn : i32, out io_dataOut : i32) {
-    %mem = seq.firmem 1, 1, undefined, port_order : <1024 x 32>
-    seq.firmem.write_port %mem[%io_addr] = %io_dataIn, clock %clock : <1024 x 32>
-    %0 = seq.firmem.read_port %mem[%io_addr], clock %clock enable %io_enable {sv.namehint = "io_dataOut"} : <1024 x 32>
-    hw.output %0 : i32
-  }
+// Test Case
+  // hw.module @ReadWriteSmem(in %clock : !seq.clock, in %reset : i1, in %io_enable : i1, in %io_write : i1, in %io_addr : i10, in %io_dataIn : i32, out io_dataOut : i32) {
+  //   %mem = seq.firmem 1, 1, undefined, port_order : <1024 x 32>
+  //   seq.firmem.write_port %mem[%io_addr] = %io_dataIn, clock %clock : <1024 x 32>
+  //   %0 = seq.firmem.read_port %mem[%io_addr], clock %clock enable %io_enable {sv.namehint = "io_dataOut"} : <1024 x 32>
+  //   hw.output %0 : i32
+  // }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~```
 // Reading out of bounds
@@ -880,6 +880,11 @@
     // CHECK-NEXT: [[SAME_ADDR_RW1:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4
     // CHECK-NEXT: [[BOTH_ENABLED_RW1:%.+]] = comb.and [[WRITEENABLED]], [[ENABLE]] : i1
     // CHECK-NEXT: [[SAME_ADDR_ENABLED_RW1:%.+]] = comb.and [[SAME_ADDR_RW1]], [[BOTH_ENABLED_RW1]] : i1
+    // READ-WRITE Conflict Check
+    // CHECK-NEXT: [[RW_WRITE_READ_ENABLED:%.+]] = comb.and [[READ_ENABLED]], [[ENABLE]] : i1
+    // CHECK-NEXT: [[RW_WR_R_CONFLICT:%.+]] = comb.and  [[SAME_ADDR_RW1]], [[RW_WRITE_READ_ENABLED]] : i1
+
+
     // Look for collisions
     // CHECK-NEXT: [[COLLISION_RW1:%.+]] = comb.or [[SAME_ADDR_ENABLED_RW1]] : i1
 
@@ -891,7 +896,11 @@
     // CHECK-NEXT: [[RAND:%.+]] = verif.symbolic_value : i20
     // CHECK-NEXT: [[READOOB:%.+]] = comb.and [[OOB]], [[READ_ENABLED]] : i1
     // CHECK-NEXT: [[READ_MUX_RW:%.+]] = comb.mux [[READOOB]], [[RAND]], [[READ_RW1]]
-    // CHECK-NEXT: hw.output [[READ_MUX_RW]] : i20
+
+    // CHECK-NEXT: [[READ_COLLISION_OCC:%.+]] = comb.or [[RW_WR_R_CONFLICT]] : i1
+    // CHECK-NEXT: [[RW_READ_WRITE_CONF_VAL:%.+]] = verif.symbolic_value : i20
+    // CHECK-NEXT: [[RW_READ_WRITE:%.+]] = comb.mux [[READ_COLLISION_OCC]], [[RW_READ_WRITE_CONF_VAL]], [[READ_MUX_RW]] : i20
+    // CHECK-NEXT: hw.output [[RW_READ_WRITE]] : i20
     // CHECK-NEXT: }
       hw.module @ReadWrite_WriteConflict(in %data: i20, in %clock: !seq.clock,  out z: i20) {
       %enable = hw.constant true // Set to constant 1
