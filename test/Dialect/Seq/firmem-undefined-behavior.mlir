@@ -77,7 +77,6 @@
   // CHECK-NEXT: verif.assert [[TMP3_W2]] label "write_enable" : i1
   // Write-write conflict, first write
   // CHECK-NEXT: [[SAME_ADDR2:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4
-  // CHECK-NEXT : [[TRUE_VAR2:%.+]] = hw.constant 1 : i1
   // CHECK-NEXT: [[BOTH_ENABLED2:%.+]] = comb.and [[ENABLE]], [[ENABLE]] : i1
   // CHECK-NEXT: [[SAME_ADDR_ENABLED2:%.+]] = comb.and [[SAME_ADDR2]], [[BOTH_ENABLED2]] : i1
   // Look for collisions
@@ -245,6 +244,10 @@
   hw.output %0 : i20
   }
 //
+
+
+
+
 
 
 // Read, Read Write, Both Disabled
@@ -441,6 +444,58 @@
   }
 //
 
+// 
+// READ WRITE, Write does not have an enable
+//------
+
+  // CHECK-LABEL: hw.module @ReadWriteConflict_WriteNoEnable
+  // Read Out of Bounds check
+  // CHECK-NEXT: [[ENABLEREAD:%.+]] = hw.constant true
+  // CHECK-NEXT: [[ADDR:%.+]] = hw.constant 6 : i4
+  // CHECK-NEXT: %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
+  // CHECK-NEXT: [[READ:%.+]] = seq.firmem.read_port %mem[[[ADDR]]], clock %clock enable [[ENABLEREAD]] : <12 x 20>
+
+  // READ OOB
+  // CHECK-NEXT: [[TMP0:%.+]] = hw.constant -4 : i4
+  // CHECK-NEXT: [[TMP1:%.+]] = comb.icmp uge [[ADDR]], [[TMP0]] : i4
+  // CHECK-NEXT: [[TMP2:%.+]] = verif.symbolic_value : i20
+  // CHECK-NEXT: [[TMP3:%.+]] = comb.mux [[TMP1]], [[TMP2]], [[READ]] : i20
+
+  // WRITE OOB
+  // CHECK-NEXT: [[ENABLEWRITE:%.+]] = hw.constant true
+  // CHECK-NEXT: [[TMP0_W:%.+]] = hw.constant -4 : i4
+  // CHECK-NEXT: [[TRUE:%.+]] = hw.constant true
+  // CHECK-NEXT: [[TMP1_W:%.+]] = comb.icmp uge [[ADDR]], [[TMP0_W]] : i4
+  // CHECK-NEXT: [[TMP2_W:%.+]] = comb.xor [[TMP1_W]], [[TRUE]] : i1
+  // CHECK-NEXT: [[TMP3_W:%.+]] = comb.and [[TMP2_W]], [[ENABLEWRITE]] : i1
+  // CHECK-NEXT: verif.assert [[TMP3_W]] label "write_enable" : i1
+  // CHECK-NEXT: seq.firmem.write_port %mem[[[ADDR]]] = %data, clock %clock : <12 x 20>
+
+  // Read write
+  // CHECK-NEXT: [[TMP4:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4 
+  // CHECK-NEXT: [[ENABLEWRITE2:%.+]] = hw.constant true
+  // CHECK-NEXT: [[TMP5:%.+]] = comb.and  [[ENABLEREAD]], [[ENABLEWRITE2]] : i1 
+  // CHECK-NEXT: [[TMP6:%.+]] = comb.and [[TMP4]], [[TMP5]] : i1 
+  // CHECK-NEXT: [[TMP7:%.+]] = comb.or [[TMP6]] : i1
+  // CHECK-NEXT: [[TMP8:%.+]] = verif.symbolic_value : i20
+  // CHECK-NEXT: [[TMP9:%.+]] = comb.mux [[TMP7]], [[TMP8]], [[TMP3]] : i20
+  // Check that the output mux is controlled by a conflict, and is between the random and intended read
+  // CHECK-NEXT: hw.output [[TMP9]] : i20
+  // CHECK-NEXT: }
+  hw.module @ReadWriteConflict_WriteNoEnable(in %data: i20, in %clock: !seq.clock,  out z: i20) {
+  %enableRead = hw.constant true // Set to constant 1
+  // %enableWrite = hw.constant true // Set to constant 1
+  %addr = hw.constant 6 : i4
+  %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
+
+  %0 = seq.firmem.read_port %mem[%addr], clock %clock enable %enableRead: <12 x 20>
+  seq.firmem.write_port %mem[%addr] = %data, clock %clock : <12 x 20>
+
+  hw.output %0 : i20
+  }
+//
+
+
 // Read write, Read disabled
 //------
 
@@ -632,6 +687,13 @@
 //
 
 
+//Test Case
+  hw.module @ReadWriteSmem(in %clock : !seq.clock, in %reset : i1, in %io_enable : i1, in %io_write : i1, in %io_addr : i10, in %io_dataIn : i32, out io_dataOut : i32) {
+    %mem = seq.firmem 1, 1, undefined, port_order : <1024 x 32>
+    seq.firmem.write_port %mem[%io_addr] = %io_dataIn, clock %clock : <1024 x 32>
+    %0 = seq.firmem.read_port %mem[%io_addr], clock %clock enable %io_enable {sv.namehint = "io_dataOut"} : <1024 x 32>
+    hw.output %0 : i32
+  }
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~```
 // Reading out of bounds
@@ -820,6 +882,7 @@
     // CHECK-NEXT: [[SAME_ADDR_ENABLED_RW1:%.+]] = comb.and [[SAME_ADDR_RW1]], [[BOTH_ENABLED_RW1]] : i1
     // Look for collisions
     // CHECK-NEXT: [[COLLISION_RW1:%.+]] = comb.or [[SAME_ADDR_ENABLED_RW1]] : i1
+
     // CHECK-NEXT: [[RANDOM_DATA_RW1:%.+]] = verif.symbolic_value : i20
     // CHECK-NEXT: [[RAND_DATA_MUX_RW1:%.+]] = comb.mux [[COLLISION_RW1]], [[RANDOM_DATA_RW1]], %data : i20
 
@@ -893,14 +956,11 @@
     // CHECK-NEXT: [[RW_Read_and_Write:%.+]] = comb.and [[READ_ENABLED1]], [[RW2_ENABLED_MODEW]] : i1
     // CHECK-NEXT: [[RW_Conflict1:%.+]] = comb.and [[SAME_ADDR_RW1]], [[RW_Read_and_Write]] : i1
 
-
-
-
-
     // Look for collisions
     // Write Collision  : n/a
     // CHECK-NEXT: [[COLLISION_RW1:%.+]] = comb.or [[WR_CONFLICT]] : i1
     // CHECK-NEXT: [[RANDOM_DATA_RW1:%.+]] = verif.symbolic_value : i20
+    // Here is issue. Relies on future.
     // CHECK-NEXT: [[RAND_DATA_MUX_RW1:%.+]] = comb.mux [[COLLISION_RW1]], [[RANDOM_DATA_RW1]], %data : i20
 
 

@@ -122,6 +122,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
     auto writeOps = instance.writes;
     auto readWriteOps = instance.readWrites;
 
+    auto i1 = b.getI1Type(); // For constants.
+
     // Loop through all the read and write ports and check if they are accessing
     // the same address
 
@@ -129,7 +131,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       // TODO: check
       b.setInsertionPointAfter(readOp);
-
+      Operation *lastOp = readOp;
       // Out of Bounds checker
       Value currentResult = readOp.getResult();
       // Width of the address?
@@ -137,6 +139,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
       uint64_t depth = instance.memOp.getMemory().getType().getDepth();
 
       llvm::SmallPtrSet<mlir::Operation *, 1> readExceptions;
+
+      Operation *lastCommand = readOp;
 
       Value muxForOOB;
       // Check if empty.
@@ -166,6 +170,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Operation *muxOOBOp = muxForOOB.getDefiningOp(); // Avery 6/27
 
         readExceptions.insert(muxOOBOp);
+        lastCommand = muxOOBOp;
         // If out of bounds, random value is the only state needed for
         //
 
@@ -209,14 +214,26 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // collide
         Value readIsEnabled = readOp.getEnable();
         Value writeIsEnabled = writeOp.getEnable();
+        if (!writeIsEnabled) { // No enable exists. Assume enabled.
+          Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
+          writeIsEnabled = writeTrue;
+        }
         Value readAndWriteEnabled =
             b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
 
         // Add this collision to the list of collisions for this read operation
-        collisionList.push_back(isCollision);
+        if (lastOp->isBeforeInBlock(
+                writeOp)) { // How to see if this is the last item in the list?
+          lastCommand = isCollision.getDefiningOp();
+          lastOp = writeOp;
+        }
 
+        // lastCommand = isCollision.getDefiningOp();
+
+        // Add this collision to the list of collisions for this read operation
+        collisionList.push_back(isCollision);
         // TODO: Push the write value on a list
         //  possibleValues.push_back(writeOp.getData()); // Avery 6/27
       }
@@ -235,12 +252,26 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value readIsEnabled = readOp.getEnable();
         Value writeModeIsEnabled = readWriteOp.getMode(); // Avery 6/27
         Value writeIsEnabled = readWriteOp.getEnable();
+        if (!writeIsEnabled) { // No enable exists. Assume enabled.
+          Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
+          writeIsEnabled = writeTrue;
+        }
         Value readWrite_ActiveWrite =
             b.create<comb::AndOp>(writeModeIsEnabled, writeIsEnabled);
         Value readAndWriteEnabled =
             b.create<comb::AndOp>(readIsEnabled, readWrite_ActiveWrite);
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+
+        if (lastOp->isBeforeInBlock(readWriteOp)) { // How to see if this is the
+                                                    // last item in the list?
+          lastCommand = isCollision.getDefiningOp();
+          lastOp = readWriteOp;
+        }
+        // if (isCollision.getDefiningOp()->getNextNode() == nullptr){ // How to
+        // see if this is the last item in the list? lastCommand =
+        // isCollision.getDefiningOp();
+        // }
 
         // Add this collision to the list of collisions for this read operation
         collisionList.push_back(isCollision);
@@ -256,6 +287,9 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // unnecessary logic
       // Value conflictTrue =
       // b.createOrFold<comb::OrOp>(mlir::ValueRange(collisionList), false);
+
+      // Todo: need to set insertion point here
+      b.setInsertionPointAfter(lastCommand);
 
       Value conflictTrue = b.create<comb::OrOp>(mlir::ValueRange(collisionList),
                                                 false); // Avery, 6/14
@@ -294,22 +328,26 @@ void UndefinedMemoryBehavior::runOnOperation() {
     // Write-Write Collisions are covered
 
     // Store the exceptions list (to make the MLIR clear to check)
-  //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     for (auto writeOp : writeOps) {
       b.setInsertionPoint(writeOp);
 
+      Operation *lastOp = writeOp;
+      Operation *lastCommand = writeOp;
       // Check OOB
       // Out of Bounds checker
 
       Value writeIsEnabled = writeOp.getEnable();
       // TODO: MAKE A HW CONSTANT IF NO EXIST, WRITEISENABLED = TRUE
+      if (!writeIsEnabled) { // No enable exists. Assume enabled.
+        Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
+        writeIsEnabled = writeTrue;
+      }
 
       Value currentEnable = writeIsEnabled;
       // Width of the address?
       // Width greater than supported?
       uint64_t depth = instance.memOp.getMemory().getType().getDepth();
-
-
 
       // Value readEnable = readOp.getEnable();
 
@@ -337,7 +375,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value not_OOB = b.create<comb::XorOp>(isOutOfBounds,
                                               constantTrue); // ADD TO MLIR 7/6
 
-                                              // TODO: CHECK IF ENABLE EXISTS. OTHERWISE< JUST SET IT TO NOT_OOB
+        // TODO: CHECK IF ENABLE EXISTS. OTHERWISE< JUST SET IT TO NOT_OOB
         Value write_enabled = b.create<comb::AndOp>(not_OOB, writeIsEnabled);
 
         // writeOp.getEnableMutable().assign(write_enabled);
@@ -382,10 +420,20 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // If they are the same address, we need to ensure they are going to
         // collide
         Value write2IsEnabled = writeOp2.getEnable();
+        if (!write2IsEnabled) { // No enable exists. Assume enabled.
+          Value write2True = b.create<hw::ConstantOp>(i1, 1);
+          write2IsEnabled = write2True;
+        }
         Value bothWritesEnabled =
             b.create<comb::AndOp>(currentEnable, write2IsEnabled);
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+
+        if (lastOp->isBeforeInBlock(
+                writeOp2)) { // How to see if this is the last item in the list?
+          lastCommand = isCollision.getDefiningOp();
+          lastOp = writeOp2;
+        }
 
         collisionList.push_back(isCollision);
         // TODO: 7/6 Add garbage to both %data.
@@ -408,6 +456,12 @@ void UndefinedMemoryBehavior::runOnOperation() {
             b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
         collisionList.push_back(isWriteCollision);
 
+        if (lastOp->isBeforeInBlock(readWriteOp)) { // How to see if this is the
+                                                    // last item in the list?
+          lastCommand = isWriteCollision.getDefiningOp();
+          lastOp = readWriteOp;
+        }
+
         // auto i1 = b.getI1Type();
         // Value constantTrue = b.create<hw::ConstantOp>(i1, 1); // TODO 7/6
         // Value notMode = b.create<comb::XorOp>(readWriteOp.getMode(),
@@ -423,6 +477,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       if (collisionList.empty())
         continue;
+
+      // b.setInsertionPointAfter(lastCommand);
 
       // 7/6
       Value conflictTrue = b.create<comb::OrOp>(mlir::ValueRange(collisionList),
@@ -444,20 +500,28 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // 7.6 ^
     }
 
-
     //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Read-Write Collisions Covered
     for (auto readWriteOp : readWriteOps) {
       b.setInsertionPoint(readWriteOp);
 
+      Operation *lastOp = readWriteOp;
+      Operation *lastCommand = readWriteOp;
       // Check OOB
       // Out of Bounds checker
 
       Value enabled = readWriteOp.getEnable();
+      if (!enabled) {
+        Value enabledTrue = b.create<hw::ConstantOp>(i1, 1);
+        enabled = enabledTrue;
+      }
       Value writeModeEnabled = readWriteOp.getMode();
       Value writeIsEnabled = b.create<comb::AndOp>(writeModeEnabled, enabled);
+      // if (!writeIsEnabled) { // No enable exists. Assume enabled.
+      //   Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
+      //   writeIsEnabled = writeTrue;
+      // }
 
-      auto i1 = b.getI1Type();
       Value constantTrue = b.create<hw::ConstantOp>(i1, 1); // TODO 7/6
       Value readModeEnabled =
           b.create<comb::XorOp>(writeModeEnabled, constantTrue);
@@ -479,7 +543,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       Value muxForOOB;
 
-      Operation * organizationOp;
+      Operation *organizationOp;
       // Check if empty.
       if (depth > 0) {
 
@@ -509,8 +573,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // If out of bounds, random value is the only state needed for
         //
 
-
-         b.setInsertionPointAfter(readWriteOp);
+        b.setInsertionPointAfter(readWriteOp);
 
         // Read OOB Check
         // Randomize if needed
@@ -529,13 +592,13 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         Operation *muxOOBOp = muxForOOB.getDefiningOp(); // Avery 6/27
         organizationOp = muxOOBOp;
+
+        lastCommand = muxOOBOp;
         // readExceptions.insert(muxOOBOp);
         //  If out of bounds, random value is the only state needed for
         //
 
-
-        
-         // TODO
+        // TODO
         currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
         // Update currentResult so later logic uses the OOB-protected value.
         currentResult = muxForOOB;
@@ -560,10 +623,19 @@ void UndefinedMemoryBehavior::runOnOperation() {
         // If they are the same address, we need to ensure they are going to
         // collide
         Value writeOpIsEnabled = writeOp.getEnable();
+        if (!writeOpIsEnabled) { // No enable exists. Assume enabled.
+          Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
+          writeOpIsEnabled = writeTrue;
+        }
         Value bothWritesEnabled =
             b.create<comb::AndOp>(writeIsEnabled, writeOpIsEnabled);
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+
+        if (lastOp->isBeforeInBlock(writeOp)) {
+          lastCommand = isCollision.getDefiningOp();
+          lastOp = writeOp;
+        }
 
         collisionList.push_back(isCollision);
         // TODO: 7/6 Add garbage to both %data.
@@ -582,13 +654,24 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // If they are the same address, we need to ensure they are going to
         // collide
-        Value readWrite_WriteConflict_valid = b.create<comb::AndOp>(
-            readWriteOp2.getEnable(), readWriteOp2.getMode());
+        Value rw2IsEnabled = readWriteOp2.getEnable();
+        if (!rw2IsEnabled) {
+          Value rwTrue = b.create<hw::ConstantOp>(i1, 1);
+          rw2IsEnabled = rwTrue;
+        }
+
+        Value readWrite_WriteConflict_valid =
+            b.create<comb::AndOp>(rw2IsEnabled, readWriteOp2.getMode());
 
         Value bothWritesEnabled = b.create<comb::AndOp>(
             writeIsEnabled, readWrite_WriteConflict_valid);
         Value isWriteCollision =
             b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+
+        //  if (lastOp->isBeforeInBlock(readWriteOp2)){ // How to see if this is
+        //  the last item in the list? lastCommand =
+        //  isWriteCollision.getDefiningOp(); lastOp = readWriteOp2;
+        //  }
         collisionList.push_back(isWriteCollision);
 
         // auto i1 = b.getI1Type();
@@ -614,6 +697,12 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // Add this collision to the list of collisions for this read operation
         readCollisionList.push_back(isReadCollision);
+        if (lastOp->isBeforeInBlock(
+                readWriteOp2)) { // How to see if this is the last item in the
+                                 // list?
+          lastCommand = isReadCollision.getDefiningOp();
+          lastOp = readWriteOp2;
+        }
       }
 
       // If both empty, continue.
@@ -624,6 +713,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
       // Check Write-Write Conflicts, input random if true.
       if (!collisionList.empty()) {
+
         Value conflictTrue =
             b.create<comb::OrOp>(mlir::ValueRange(collisionList),
                                  false); // Avery, 6/14
@@ -643,19 +733,18 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         readWriteOp.getWriteDataMutable().set(mux);
 
-        //Operation *muxOp = mux.getDefiningOp();
-        //currentData.replaceAllUsesExcept(mux, muxOp);
-        // 7.6 ^
+        // Operation *muxOp = mux.getDefiningOp();
+        // currentData.replaceAllUsesExcept(mux, muxOp);
+        //  7.6 ^
       }
       if (!readCollisionList.empty()) {
-
-
+        // b.setInsertionPointAfter(lastCommand);
         if (organizationOp) {
-            b.setInsertionPointAfter(organizationOp);
-          } else {
-            b.setInsertionPointAfter(readWriteOp);
+          b.setInsertionPointAfter(organizationOp);
+        } else {
+          b.setInsertionPointAfter(readWriteOp);
         }
-        
+
         // b.setInsertionPointToEnd(readWriteOp->getBlock());
         // Read Collision
 
@@ -691,6 +780,5 @@ void UndefinedMemoryBehavior::runOnOperation() {
         currentResult.replaceAllUsesExcept(mux, muxOp);
       }
     }
-
   }
 }
