@@ -634,7 +634,6 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value isCollision =
             b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
 
-      
         if (lastOp->isBeforeInBlock(writeOp)) {
           lastCommand = isCollision.getDefiningOp();
           lastOp = writeOp;
@@ -648,8 +647,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
             b.create<comb::AndOp>(readIsEnabled, writeOpIsEnabled);
         Value isReadCollision =
             b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
-        //8/15: WHY NOT WHAT
-        // Add this collision to the list of collisions for this read operation
+        // 8/15: WHY NOT WHAT
+        //  Add this collision to the list of collisions for this read operation
         readCollisionList.push_back(isReadCollision);
       }
 

@@ -1,4 +1,7 @@
 // RUN: circt-opt --undefined-memory-behavior --split-input-file %s | FileCheck %s
+
+// DELETE ALL NON- CHECK comments below this line
+
 // circt-opt --undefined-memory-behavior tests/Dialect/Seq/firmem-undefined-behavior.mlir
 
 // TODO: CHECK LOGICAL EQUIVALENCE WITH SCALA using a script - bash or python that has an example design and proves they are the same.
@@ -16,7 +19,7 @@
 // Write OOB
 //-----
 
-  //CHECK-LABEL: hw.module @WriteConflict_OOB
+  // CHECK-LABEL: hw.module @WriteConflict_OOB
   // Read Out of Bounds check
   // CHECK-NEXT: [[ENABLE:%.+]] = hw.constant true
   // CHECK-NEXT: [[ADDR:%.+]] = hw.constant 6 : i4
@@ -33,16 +36,12 @@
   // CHECK-NEXT: hw.output [[ADDR]] : i4
   // CHECK-NEXT: }
     hw.module @WriteConflict_OOB(in %data: i20, in %clock: !seq.clock,  out z: i4) {
-    %enable = hw.constant true // Set to constant 1
-    %addr = hw.constant 6 : i4
-    %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
-
+      %enable = hw.constant true // Set to constant 1
+      %addr = hw.constant 6 : i4
+      %mem = seq.firmem 0, 1, undefined, undefined : <12 x 20>
       seq.firmem.write_port %mem[%addr] = %data, clock %clock enable %enable: <12 x 20>
-
-    // Does a write have an output?
       hw.output %addr : i4
     }
-//
 
 // Write-Write Conflict
 // -----
