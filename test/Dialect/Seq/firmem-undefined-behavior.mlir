@@ -436,7 +436,7 @@
   // CHECK-NEXT: [[TMP9:%.+]] = comb.mux [[TMP7]], [[TMP8]], [[TMP3]] : i20
   // CHECK-NEXT: hw.output [[TMP9]] : i20
   // CHECK-NEXT: }
-  hw.module @ReadWriteConflict_BothEnabledOOB(in %data: i20, in %clock: !seq.clock,  out z: i20) {
+  hw.module @Read_Write_Conflict_BothEnabledOOB(in %data: i20, in %clock: !seq.clock,  out z: i20) {
     %enableRead = hw.constant true // Set to constant 1
     %enableWrite = hw.constant true // Set to constant 1
   
