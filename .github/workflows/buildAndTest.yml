@@ -24,7 +24,7 @@ jobs:
       # Clone the CIRCT repo and its submodules. Do shallow clone to save clone
       # time.
       - name: Get CIRCT
-        uses: actions/checkout@v3
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 2
           submodules: "false"
@@ -109,7 +109,7 @@ jobs:
       # Upload the format patches to an artifact (zip'd) associated
       # with the workflow run. Only run this on a failure.
       - name: Upload format patches
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         continue-on-error: true
         if: ${{ failure() }}
         with:
@@ -141,7 +141,7 @@ jobs:
       # Clone CIRCT as shallow as possible.  We just need the `.github`
       # directory.
       - name: Get CIRCT (for .github)
-        uses: actions/checkout@v3
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 1
           submodules: "false"
@@ -152,43 +152,41 @@ jobs:
           config=$(cat <<EOF
           [
             {
-              "name": "Linux (GCC)",
+              "name": "Linux (GCC) Integration",
               "install_target": "",
               "package_name_prefix": "",
               "cmake_build_type": "release",
               "llvm_enable_assertions": "ON",
               "build_shared_libs": "ON",
-              "llvm_force_enable_stats": "ON",
               "run_tests": true,
+              "run_integration_tests": true,
               "runner": "ubuntu-24.04",
-              "cmake_c_compiler": "gcc",
-              "cmake_cxx_compiler": "g++"
+              "cmake_c_compiler": "gcc"
             },
             {
-              "name": "Linux (Clang)",
+              "name": "Linux (Clang) Integration w/ Reverse Iteration",
               "install_target": "",
               "package_name_prefix": "",
               "cmake_build_type": "release",
               "llvm_enable_assertions": "OFF",
               "build_shared_libs": "OFF",
-              "llvm_force_enable_stats": "ON",
               "run_tests": true,
+              "run_integration_tests": true,
               "runner": "ubuntu-24.04",
               "cmake_c_compiler": "clang",
-              "cmake_cxx_compiler": "clang++"
+              "extra_cmake_args": "-DLLVM_ENABLE_REVERSE_ITERATION=ON"
             },
             {
-              "name": "Windows",
+              "name": "Windows Test",
               "install_target": "",
               "package_name_prefix": "",
               "cmake_build_type": "release",
               "llvm_enable_assertions": "ON",
               "build_shared_libs": "OFF",
-              "llvm_force_enable_stats": "ON",
               "run_tests": true,
+              "run_integration_tests": false,
               "runner": "windows-2022",
-              "cmake_c_compiler": "cl",
-              "cmake_cxx_compiler": "cl"
+              "cmake_c_compiler": "cl"
             }
           ]
           EOF
@@ -206,7 +204,7 @@ jobs:
 
   # Build CIRCT and run its tests.
   build-and-test:
-    name: "Test: ${{ matrix.generated.name }}"
+    name: ${{ matrix.generated.name }}
     needs:
       - sanity-check
       - choose-matrix
@@ -223,44 +221,36 @@ jobs:
       cmake_build_type: ${{ matrix.generated.cmake_build_type }}
       build_shared_libs: ${{ matrix.generated.build_shared_libs }}
       llvm_enable_assertions: ${{ matrix.generated.llvm_enable_assertions }}
-      llvm_force_enable_stats: ${{ matrix.generated.llvm_force_enable_stats }}
       run_tests: ${{ matrix.generated.run_tests }}
+      run_integration_tests: ${{ matrix.generated.run_integration_tests }}
       install_target: ${{ matrix.generated.install_target }}
       package_name_prefix: ${{ matrix.generated.package_name_prefix }}
       cmake_c_compiler: ${{ matrix.generated.cmake_c_compiler }}
-      cmake_cxx_compiler: ${{ matrix.generated.cmake_cxx_compiler }}
+      extra_cmake_args: ${{ matrix.generated.extra_cmake_args }}
 
   # --- end of build-circt job.
 
-  # Dispatch a test run in circt/circt-tests once the entire build matrix has
-  # succeeded.
-  dispatch-circt-tests:
-    name: Dispatch circt-tests
-    needs: build-and-test
+  # Upload metadata about the triggering event so the companion
+  # `dispatchCirctTests.yml` workflow can pick it up. That workflow runs on
+  # `workflow_run`, which executes in the context of this repository and
+  # therefore has access to `CIRCT_TESTS_DISPATCH_TOKEN` even for PRs opened
+  # from forks (regular `pull_request` runs from forks do not).
+  #
+  # We deliberately do not depend on `build-and-test` here: the dispatcher
+  # gates on `workflow_run.conclusion == 'success'`, which already reflects
+  # whether the build matrix passed.
+  upload-dispatch-metadata:
+    name: Upload Dispatch Metadata
     runs-on: ubuntu-latest
-    env:
-      GH_TOKEN: ${{ secrets.CIRCT_TESTS_DISPATCH_TOKEN }}
     steps:
-      - name: Dispatch circt-tests
-        if: env.GH_TOKEN != ''
+      - name: Write PR number
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            KIND=main
-            SHA=main
-            REPO="${{ github.repository }}"
-            PR_NUMBER=""
-          elif [ "${{ github.event_name }}" = "pull_request" ]; then
-            KIND=pr
-            SHA="${{ github.event.pull_request.head.ref }}"
-            REPO="${{ github.event.pull_request.head.repo.full_name }}"
-            PR_NUMBER="${{ github.event.pull_request.number }}"
-          else
-            echo "Unhandled event type: ${{ github.event_name }}, skipping."
-            exit 0
-          fi
-          DISPATCH_ARGS="-f kind=$KIND -f sha=$SHA -f repo=$REPO"
-          if [ -n "$PR_NUMBER" ]; then
-            DISPATCH_ARGS="$DISPATCH_ARGS -f pr_number=$PR_NUMBER"
-          fi
-          echo "Dispatching circt-tests with args: $DISPATCH_ARGS"
-          gh workflow run test.yml --repo circt/circt-tests $DISPATCH_ARGS
+          mkdir -p dispatch-metadata
+          echo "${{ github.event.pull_request.number }}" \
+            > dispatch-metadata/pr_number
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dispatch-metadata
+          path: dispatch-metadata/
+          retention-days: 1
