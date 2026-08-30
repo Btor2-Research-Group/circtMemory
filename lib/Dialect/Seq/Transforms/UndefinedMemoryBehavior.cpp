@@ -53,6 +53,87 @@ private:
 
 } // namespace
 
+// check_write_write_conflict();
+
+void check_write_out_of_bounds(ImplicitLocOpBuilder &b, Value *isOutOfBoundsPtr,
+                               Value *constantTruePtr,
+                               Value *writeIsEnabledPtr) {
+  Value not_OOB = b.create<comb::XorOp>(*isOutOfBoundsPtr, *constantTruePtr);
+  Value write_enabled_NOOB = b.create<comb::AndOp>(not_OOB, *writeIsEnabledPtr);
+  b.create<verif::AssertOp>(write_enabled_NOOB, Value(),
+                            b.getStringAttr("write_enable"));
+}
+
+void check_read_out_of_bounds(
+    ImplicitLocOpBuilder &b, Namespace &symbolNamespace, Operation *op,
+    Value *currentResultPtr,
+    llvm::SmallPtrSet<mlir::Operation *, 1> *readExceptions,
+    Operation **lastCommand, uint64_t depth, Value *RW_readIsEnabled,
+    Value *isOutOfBoundsPtr) {
+  Value currentResult = *currentResultPtr;
+  Value addr;
+  Value isOutOfBoundsTemp;
+  llvm::SmallPtrSet<mlir::Operation *, 1> readExceptionsTemp;
+  if (!readExceptions)
+    readExceptions = &readExceptionsTemp;
+
+  if (depth > 0) {
+    if (auto readOp = dyn_cast<seq::FirMemReadOp>(op)) {
+      addr = readOp.getAddress();
+      Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
+      Value isOutOfBoundsTemp =
+          b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
+      isOutOfBoundsPtr = &isOutOfBoundsTemp;
+    } else {
+      if (auto writeOp = dyn_cast<seq::FirMemWriteOp>(op)) {
+        // Not supposed to be called, write
+        //  addr = writeOp.getAddress();
+        return;
+      } else if (auto readWriteOp = dyn_cast<seq::FirMemReadWriteOp>(op)) {
+        // addr = readWriteOp.getAddress();
+      }
+    }
+
+    // Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
+    //  Hazard if: (Address >= Depth) which means we are out of bounds and
+    //  can have undefined behavior Use a symbolic value so at runtime the
+    //  value is chosen nondeterministically
+
+    // We were not provided the info of our of bounds
+    // if (!isOutOfBoundsPtr) {
+    //   Value isOutOfBoundsTemp =
+    //       b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
+    //   isOutOfBoundsPtr = &isOutOfBoundsTemp;
+    // }
+    auto oobName = symbolNamespace.newName("randomValueForOOB");
+    auto randomSymbolicOOB = verif::SymbolicValueOp::create(
+        b, currentResult.getType(), b.getStringAttr(oobName));
+    Value randomOOBVal = randomSymbolicOOB.getResult();
+
+    // Set the random value
+    // If readWriteOp, the control also depends on if a read command
+    if (auto readWriteOp = dyn_cast<seq::FirMemReadWriteOp>(op)) {
+      *isOutOfBoundsPtr =
+          b.create<comb::AndOp>(*isOutOfBoundsPtr, *RW_readIsEnabled);
+    }
+    //
+    Value muxForOOB =
+        b.create<comb::MuxOp>(*isOutOfBoundsPtr, randomOOBVal, currentResult);
+    Operation *muxOOBOp = muxForOOB.getDefiningOp();
+
+    // Add the MUX to the list of ports to not update
+    readExceptions->insert(muxOOBOp);
+
+    // Update the final command added for continuity
+    *lastCommand = muxOOBOp;
+
+    // Update with new MUX value
+    currentResult.replaceAllUsesExcept(muxForOOB, *readExceptions);
+
+    *currentResultPtr = muxForOOB;
+  }
+}
+
 void UndefinedMemoryBehavior::runOnOperation() {
   auto module = getOperation();
 
@@ -107,6 +188,8 @@ void UndefinedMemoryBehavior::runOnOperation() {
     // Address all conflicts that can occur with
     // a Read Operation
     // Includes: Read-Write Conflict, Read OOB
+    uint64_t depth = instance.memOp.getMemory().getType().getDepth();
+
     for (auto readOp : readOps) {
 
       // Initialize OpBuilder
@@ -119,41 +202,46 @@ void UndefinedMemoryBehavior::runOnOperation() {
                   // of port references.
 
       Value currentResult = readOp.getResult();
-      uint64_t depth = instance.memOp.getMemory().getType().getDepth();
 
       // Tracking all updated ports so "replace all uses except" has a valid
       // argument
       llvm::SmallPtrSet<mlir::Operation *, 1> readExceptions;
 
       // Check if out of bounds.
-      if (depth > 0) {
-        Value addr = readOp.getAddress();
-        Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
+      check_read_out_of_bounds(b, symbolNamespace, readOp, &currentResult,
+                               &readExceptions, &lastCommand, depth, nullptr,
+                               nullptr);
 
-        // Hazard if: (Address >= Depth) which means we are out of bounds and
-        // can have undefined behavior Use a symbolic value so at runtime the
-        // value is chosen nondeterministically
-        Value isOutOfBounds =
-            b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
-        auto oobName = symbolNamespace.newName("randomValueForOOB");
-        auto randomSymbolicOOB = verif::SymbolicValueOp::create(
-            b, currentResult.getType(), b.getStringAttr(oobName));
-        Value randomOOBVal = randomSymbolicOOB.getResult();
+      // if (depth > 0) {
+      //   Value addr = readOp.getAddress();
+      //   Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
 
-        // Set the random value
-        Value muxForOOB =
-            b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal, currentResult);
-        Operation *muxOOBOp = muxForOOB.getDefiningOp();
+      //   // Hazard if: (Address >= Depth) which means we are out of bounds and
+      //   // can have undefined behavior Use a symbolic value so at runtime the
+      //   // value is chosen nondeterministically
+      //   Value isOutOfBounds =
+      //       b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr,
+      //       depthValue);
+      //   auto oobName = symbolNamespace.newName("randomValueForOOB");
+      //   auto randomSymbolicOOB = verif::SymbolicValueOp::create(
+      //       b, currentResult.getType(), b.getStringAttr(oobName));
+      //   Value randomOOBVal = randomSymbolicOOB.getResult();
 
-        // Add the MUX to the list of ports to not update
-        readExceptions.insert(muxOOBOp);
-        // Update the final command added for continuity
-        lastCommand = muxOOBOp;
+      //   // Set the random value
+      //   Value muxForOOB =
+      //       b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal,
+      //       currentResult);
+      //   Operation *muxOOBOp = muxForOOB.getDefiningOp();
 
-        // Update with new MUX value
-        currentResult.replaceAllUsesExcept(muxForOOB, readExceptions);
-        currentResult = muxForOOB;
-      }
+      //   // Add the MUX to the list of ports to not update
+      //   readExceptions.insert(muxOOBOp);
+      //   // Update the final command added for continuity
+      //   lastCommand = muxOOBOp;
+
+      //   // Update with new MUX value
+      //   currentResult.replaceAllUsesExcept(muxForOOB, readExceptions);
+      //   currentResult = muxForOOB;
+      // }
 
       // If either list is empty we can return early.
       if (readOps.empty() || (writeOps.empty() && readWriteOps.empty())) {
@@ -298,19 +386,22 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
         Value constantTrue = b.create<hw::ConstantOp>(i1, 1);
 
-        // Hazard if: (Address >= Depth) which means we are out of bounds and
-        // can have undefined behavior Use a symbolic value so at runtime the
-        // value is chosen nondeterministically
+        // // Hazard if: (Address >= Depth) which means we are out of bounds and
+        // // can have undefined behavior Use a symbolic value so at runtime the
+        // // value is chosen nondeterministically
         Value isOutOfBounds =
             b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
 
-        // Assert that the write is enabled, and is in bounds
-        Value not_OOB = b.create<comb::XorOp>(isOutOfBounds, constantTrue);
+        // // Assert that the write is enabled, and is in bounds
+        // Value not_OOB = b.create<comb::XorOp>(isOutOfBounds, constantTrue);
 
-        Value write_enabled_in_bounds =
-            b.create<comb::AndOp>(not_OOB, writeIsEnabled);
-        b.create<verif::AssertOp>(write_enabled_in_bounds, Value(),
-                                  b.getStringAttr("write_enable"));
+        // Value write_enabled_in_bounds =
+        //     b.create<comb::AndOp>(not_OOB, writeIsEnabled);
+        // b.create<verif::AssertOp>(write_enabled_in_bounds, Value(),
+        //                           b.getStringAttr("write_enable"));
+
+        check_write_out_of_bounds(b, &isOutOfBounds, &constantTrue,
+                                  &writeIsEnabled);
       }
 
       // Check for Write-Write Conflicts
@@ -431,6 +522,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
       // Used to track if a mux has been instantiated from the readWrite output
       Operation *organizationOp;
       // Check if out of bounds
+
       if (depth > 0) {
 
         Value addr = readWriteOp.getAddress();
@@ -442,32 +534,15 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value isOutOfBounds =
             b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
 
-        // Assert that if a write it is not out of bounds.
-        Value not_OOB = b.create<comb::XorOp>(isOutOfBounds, constantTrue);
-        Value write_enabled_NOOB =
-            b.create<comb::AndOp>(not_OOB, writeIsEnabled);
-        b.create<verif::AssertOp>(write_enabled_NOOB, Value(),
-                                  b.getStringAttr("write_enable"));
+        check_write_out_of_bounds(b, &isOutOfBounds, &constantTrue,
+                                  &writeIsEnabled);
 
         b.setInsertionPointAfter(readWriteOp); // For correct MLIR ordering.
 
-        // Read OOB Check
-        // Randomize if needed
-        auto oobName = symbolNamespace.newName("randomValueForOOB");
-        auto randomSymbolicOOB = verif::SymbolicValueOp::create(
-            b, currentResult.getType(), b.getStringAttr(oobName));
+        check_read_out_of_bounds(b, symbolNamespace, readWriteOp,
+                                 &currentResult, nullptr, &organizationOp,
+                                 depth, &readIsEnabled, &isOutOfBounds);
 
-        Value randomOOBVal = randomSymbolicOOB.getResult();
-        Value isEnabled_OOB_read =
-            b.create<comb::AndOp>(isOutOfBounds, readIsEnabled);
-        Value muxForOOB = b.create<comb::MuxOp>(isEnabled_OOB_read,
-                                                randomOOBVal, currentResult);
-        Operation *muxOOBOp = muxForOOB.getDefiningOp();
-        organizationOp = muxOOBOp;
-
-        // Update tracking list, and replace old result with new.
-        currentResult.replaceAllUsesExcept(muxForOOB, muxOOBOp);
-        currentResult = muxForOOB;
         b.setInsertionPoint(readWriteOp);
       }
 
