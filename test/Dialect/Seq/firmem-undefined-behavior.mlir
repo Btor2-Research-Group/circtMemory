@@ -91,7 +91,7 @@
   // CHECK-NEXT: [[RAND:%.+]] = verif.symbolic_value : i20
   // CHECK-NEXT: [[READOOB:%.+]] = comb.and [[OOB]], [[READ_ENABLED]] : i1
   // CHECK-NEXT: [[READ_MUX_RW:%.+]] = comb.mux [[READOOB]], [[RAND]], [[READ_RW1]]
-  // CHECK-NEXT: [[TMP5:%.+]] = comb.and [[MODE]], [[ENABLERW]] : i1 
+  // CHECK-NEXT: [[TMP5:%.+]] = comb.and [[ENABLERW]], [[MODE]] : i1 
   // CHECK-NEXT: [[TMP4:%.+]] = comb.icmp eq [[ADDRRD]], [[ADDRRW]] : i4 
   // CHECK-NEXT: [[TMP6:%.+]] = comb.and [[ENABLERD]], [[TMP5]] : i1 
   // CHECK-NEXT: [[TMP7:%.+]] = comb.and [[TMP4]], [[TMP6]] : i1 
@@ -282,7 +282,6 @@
   // CHECK-NEXT: [[TMP7:%.+]] = comb.or [[TMP6]] : i1
   // CHECK-NEXT: [[TMP8:%.+]] = verif.symbolic_value : i20
   // CHECK-NEXT: [[TMP9:%.+]] = comb.mux [[TMP7]], [[TMP8]], [[TMP3]] : i20
-  // Check that the output mux is controlled by a conflict, and is between the random and intended read
   // CHECK-NEXT: hw.output [[TMP9]] : i20
   // CHECK-NEXT: }
   hw.module @Read_Write_Conflict_BothEnabled(in %data: i20, in %clock: !seq.clock,  out z: i20) {
@@ -599,8 +598,8 @@
   // CHECK-NEXT: [[TMP2_W:%.+]] = comb.xor [[TMP1_W]], [[TRUE]] : i1
   // CHECK-NEXT: [[TMP3_W:%.+]] = comb.and [[TMP2_W]], [[ENABLE]] : i1
   // CHECK-NEXT: verif.assert [[TMP3_W]] label "write_enable" : i1
-  // CHECK-NEXT: [[SAME_ADDR1:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4
   // CHECK-NEXT: [[RW_ENABLED:%.+]] = comb.and [[ENABLE]], [[MODE]] : i1
+  // CHECK-NEXT: [[SAME_ADDR1:%.+]] = comb.icmp eq [[ADDR]], [[ADDR]] : i4
   // CHECK-NEXT: [[BOTH_ENABLED1:%.+]] = comb.and [[ENABLE]], [[RW_ENABLED]] : i1
   // CHECK-NEXT: [[SAME_ADDR_ENABLED:%.+]] = comb.and [[SAME_ADDR1]], [[BOTH_ENABLED1]] : i1
   // CHECK-NEXT: [[COLLISION1:%.+]] = comb.or [[SAME_ADDR_ENABLED]] : i1
