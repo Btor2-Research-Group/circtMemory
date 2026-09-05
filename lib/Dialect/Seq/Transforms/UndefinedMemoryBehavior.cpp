@@ -64,6 +64,70 @@ void check_write_out_of_bounds(ImplicitLocOpBuilder &b, Value *isOutOfBoundsPtr,
                             b.getStringAttr("write_enable"));
 }
 
+void check_read_write_conflict(ImplicitLocOpBuilder &b, Operation *readOpPTR,
+                               Operation *writeOpPTR,
+                               SmallVector<Value> *collisionList,
+                               Value *RW_readIsEnabled, Value *writeEnabled,
+                               Value *isCollision, Value *sameAddressPTR) {
+  // Check if they are the same Address
+  Value readAddr;
+  Value writeAddr;
+  Value readIsEnabled;
+  Value isSameAddress;
+  bool readOpInput = false;
+
+  if (auto readOp = dyn_cast<seq::FirMemReadOp>(readOpPTR)) {
+    readAddr = readOp.getAddress();
+    readIsEnabled = readOp.getEnable();
+    readOpInput = true;
+  } else if (auto readWriteOp = dyn_cast<seq::FirMemReadWriteOp>(readOpPTR)) {
+    readAddr = readWriteOp.getAddress();
+    readIsEnabled = *RW_readIsEnabled;
+  } else {
+    // Incorrect input type, return.
+    return;
+  }
+
+  if (auto writeOp = dyn_cast<seq::FirMemWriteOp>(writeOpPTR)) {
+    writeAddr = writeOp.getAddress();
+  } else if (auto readWriteOp = dyn_cast<seq::FirMemReadWriteOp>(writeOpPTR)) {
+    writeAddr = readWriteOp.getAddress();
+  } else {
+    // Incorrect input type, return.
+    return;
+  }
+
+  if (readOpInput) {
+    isSameAddress =
+        b.create<comb::ICmpOp>(comb::ICmpPredicate::eq, readAddr, writeAddr);
+  } else {
+    isSameAddress = *sameAddressPTR;
+  }
+  // Value readIsEnabled = readOp.getEnable();
+  // Value writeIsEnabled = writeOp.getEnable();
+
+  // if (!writeIsEnabled) { // No enable exists. Assume enabled.
+  //   Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
+  //   writeIsEnabled = writeTrue;
+  // }
+
+  Value readAndWriteEnabled =
+      b.create<comb::AndOp>(readIsEnabled, *writeEnabled);
+  *isCollision = b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+
+  // Add this collision to the list of collisions for this read operation
+  collisionList->push_back(*isCollision);
+  // return &isCollision;
+}
+
+void check_read_write_conflict(ImplicitLocOpBuilder &b, Operation *readOpPTR,
+                               Operation *writeOpPTR,
+                               SmallVector<Value> *collisionList,
+                               Value *writeEnabled, Value *isCollision) {
+  check_read_write_conflict(b, readOpPTR, writeOpPTR, collisionList, nullptr,
+                            writeEnabled, isCollision, nullptr);
+}
+
 void check_read_out_of_bounds(
     ImplicitLocOpBuilder &b, Namespace &symbolNamespace, Operation *op,
     Value *currentResultPtr,
@@ -134,6 +198,78 @@ void check_read_out_of_bounds(
   }
 }
 
+void check_write_write_conflict(ImplicitLocOpBuilder &b, Operation *writeOp1PTR,
+                                Operation *writeOp2PTR,
+                                SmallVector<Value> *writeCollisionList,
+                                Value *isSameAddress, Value *write1IsEnabled,
+                                Value *write2IsEnabled) {
+  Value bothWritesEnabled =
+      b.create<comb::AndOp>(*write1IsEnabled, *write2IsEnabled);
+  Value isWriteCollision =
+      b.create<comb::AndOp>(*isSameAddress, bothWritesEnabled);
+  writeCollisionList->push_back(isWriteCollision);
+}
+
+void check_rwOp_conflicts(ImplicitLocOpBuilder &b, Operation *readWriteOpPTR,
+                          Operation *writeOpPTR,
+                          SmallVector<Value> *writeCollisionList,
+                          SmallVector<Value> *readCollisionList,
+                          Value *writeEnabled, Value *readEnabled) {
+  auto i1 = b.getI1Type(); // For constants.
+  auto readWriteOp = dyn_cast<seq::FirMemReadWriteOp>(readWriteOpPTR);
+  Value writeAddr;
+  Value write2IsEnabled;
+  Value rw2_write_valid;
+  // No ReadWriteOp was input as the primary
+  if (!(readWriteOp)) {
+    return;
+  }
+
+  if (auto writeOp = dyn_cast<seq::FirMemWriteOp>(writeOpPTR)) {
+    writeAddr = writeOp.getAddress();
+    write2IsEnabled = writeOp.getEnable();
+    if (!write2IsEnabled)
+      write2IsEnabled = b.create<hw::ConstantOp>(i1, 1);
+
+  } else if (auto readWriteOp2 = dyn_cast<seq::FirMemReadWriteOp>(writeOpPTR)) {
+    writeAddr = readWriteOp2.getAddress();
+    Value rw2_enable = readWriteOp2.getEnable();
+    if (!rw2_enable)
+      rw2_enable = b.create<hw::ConstantOp>(i1, 1);
+
+    write2IsEnabled = b.create<comb::AndOp>(rw2_enable, readWriteOp2.getMode());
+  } else {
+    // Invalid input
+    return;
+  }
+
+  Value isSameAddress = b.create<comb::ICmpOp>(
+      comb::ICmpPredicate::eq, readWriteOp.getAddress(), writeAddr);
+  // Functions
+  check_write_write_conflict(b, readWriteOpPTR, writeOpPTR, writeCollisionList,
+                             &isSameAddress, writeEnabled, &write2IsEnabled);
+  // Write Write Conflict
+  // Value bothWritesEnabled =
+  //     b.create<comb::AndOp>(*writeEnabled, rw2_write_valid);
+  // //Value isWriteCollision =
+  //     b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+
+  // writeCollisionList->push_back(isWriteCollision);
+
+  // Read-write collision, assume the first RW is a read.
+  Value isReadCollision;
+
+  check_read_write_conflict(b, readWriteOpPTR, writeOpPTR, readCollisionList,
+                            readEnabled, &write2IsEnabled, &isReadCollision,
+                            &isSameAddress);
+
+  // Call read-write collisions, assuming the RW is a read
+  // check_read_write_conflict(b,rwOpPTR, otherOpPTR, readCollisionList,
+  // RW_readIsEnabled, RW_writeIsEnabled, writeEnabled)
+}
+
+void check_readOp_rw_conflicts() {}
+
 void UndefinedMemoryBehavior::runOnOperation() {
   auto module = getOperation();
 
@@ -197,9 +333,9 @@ void UndefinedMemoryBehavior::runOnOperation() {
       Operation *lastOp = readOp; // Track if the read, readwrite, or write is
                                   // physically the last op added for correct
                                   // continuity of port references in the MLIR
-      Operation *lastCommand =
-          readOp; // Track the last command used for the builder for continuity
-                  // of port references.
+      Operation *lastCommand = readOp;
+      // Track the last command used for the builder for continuity
+      // of port references.
 
       Value currentResult = readOp.getResult();
 
@@ -211,37 +347,6 @@ void UndefinedMemoryBehavior::runOnOperation() {
       check_read_out_of_bounds(b, symbolNamespace, readOp, &currentResult,
                                &readExceptions, &lastCommand, depth, nullptr,
                                nullptr);
-
-      // if (depth > 0) {
-      //   Value addr = readOp.getAddress();
-      //   Value depthValue = b.create<hw::ConstantOp>(addr.getType(), depth);
-
-      //   // Hazard if: (Address >= Depth) which means we are out of bounds and
-      //   // can have undefined behavior Use a symbolic value so at runtime the
-      //   // value is chosen nondeterministically
-      //   Value isOutOfBounds =
-      //       b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr,
-      //       depthValue);
-      //   auto oobName = symbolNamespace.newName("randomValueForOOB");
-      //   auto randomSymbolicOOB = verif::SymbolicValueOp::create(
-      //       b, currentResult.getType(), b.getStringAttr(oobName));
-      //   Value randomOOBVal = randomSymbolicOOB.getResult();
-
-      //   // Set the random value
-      //   Value muxForOOB =
-      //       b.create<comb::MuxOp>(isOutOfBounds, randomOOBVal,
-      //       currentResult);
-      //   Operation *muxOOBOp = muxForOOB.getDefiningOp();
-
-      //   // Add the MUX to the list of ports to not update
-      //   readExceptions.insert(muxOOBOp);
-      //   // Update the final command added for continuity
-      //   lastCommand = muxOOBOp;
-
-      //   // Update with new MUX value
-      //   currentResult.replaceAllUsesExcept(muxForOOB, readExceptions);
-      //   currentResult = muxForOOB;
-      // }
 
       // If either list is empty we can return early.
       if (readOps.empty() || (writeOps.empty() && readWriteOps.empty())) {
@@ -258,30 +363,41 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // If they are the same address, we need to check they are going to
         // collide
-        auto isSameAddress = b.create<comb::ICmpOp>(
-            comb::ICmpPredicate::eq, readOp.getAddress(), writeOp.getAddress());
+        // auto isSameAddress = b.create<comb::ICmpOp>(
+        //     comb::ICmpPredicate::eq, readOp.getAddress(),
+        //     writeOp.getAddress());
 
-        Value readIsEnabled = readOp.getEnable();
+        // Value readIsEnabled = readOp.getEnable();
         Value writeIsEnabled = writeOp.getEnable();
         if (!writeIsEnabled) { // No enable exists. Assume enabled.
           Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
           writeIsEnabled = writeTrue;
         }
 
-        Value readAndWriteEnabled =
-            b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
-        Value isCollision =
-            b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+        Value isCollision;
 
-        // Order the insertion of ports based on the order the ports
+        check_read_write_conflict(b, readOp, writeOp, &collisionList,
+                                  &writeIsEnabled, &isCollision);
+
+        if (!isCollision) {
+          // Incorrect input
+          return;
+        }
+
+        // Value readAndWriteEnabled =
+        //     b.create<comb::AndOp>(readIsEnabled, writeIsEnabled);
+        // Value isCollision =
+        //     b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+
+        // // Order the insertion of ports based on the order the ports
         // are instantiated
         if (lastOp->isBeforeInBlock(writeOp)) {
           lastCommand = isCollision.getDefiningOp();
           lastOp = writeOp;
         }
 
-        // Add this collision to the list of collisions for this read operation
-        collisionList.push_back(isCollision);
+        // // Add this collision to the list of collisions for this read
+        // operation collisionList.push_back(isCollision);
       }
 
       // Check the check the readWrite Ports for a write conflict with the
@@ -292,10 +408,11 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // If they are the same address, we need to check if they are going to
         // collide
-        auto isSameAddress =
-            b.create<comb::ICmpOp>(comb::ICmpPredicate::eq, readOp.getAddress(),
-                                   readWriteOp.getAddress());
-        Value readIsEnabled = readOp.getEnable();
+        // auto isSameAddress =
+        //     b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
+        //     readOp.getAddress(),
+        //                            readWriteOp.getAddress());
+        // Value readIsEnabled = readOp.getEnable();
         Value writeModeIsEnabled =
             readWriteOp.getMode(); // check for write active
         Value writeIsEnabled = readWriteOp.getEnable();
@@ -305,12 +422,21 @@ void UndefinedMemoryBehavior::runOnOperation() {
           writeIsEnabled = writeTrue;
         }
 
-        Value readWrite_ActiveWrite =
+        Value rw_ActiveWrite =
             b.create<comb::AndOp>(writeModeIsEnabled, writeIsEnabled);
-        Value readAndWriteEnabled =
-            b.create<comb::AndOp>(readIsEnabled, readWrite_ActiveWrite);
-        Value isCollision =
-            b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+
+        Value isCollision;
+        check_read_write_conflict(b, readOp, readWriteOp, &collisionList,
+                                  &rw_ActiveWrite, &isCollision);
+        if (!isCollision) {
+          // Incorrect input
+
+          return;
+        }
+        // Value readAndWriteEnabled =
+        //     b.create<comb::AndOp>(readIsEnabled, readWrite_ActiveWrite);
+        // Value isCollision =
+        //     b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
 
         // Order the insertion of ports based on the order the ports
         // are instantiated
@@ -320,7 +446,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
         }
 
         // Add this collision to the list of collisions for this read operation
-        collisionList.push_back(isCollision);
+        // collisionList.push_back(isCollision);
       }
 
       // Skip if potential collisions exist
@@ -394,11 +520,6 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // // Assert that the write is enabled, and is in bounds
         // Value not_OOB = b.create<comb::XorOp>(isOutOfBounds, constantTrue);
-
-        // Value write_enabled_in_bounds =
-        //     b.create<comb::AndOp>(not_OOB, writeIsEnabled);
-        // b.create<verif::AssertOp>(write_enabled_in_bounds, Value(),
-        //                           b.getStringAttr("write_enable"));
 
         check_write_out_of_bounds(b, &isOutOfBounds, &constantTrue,
                                   &writeIsEnabled);
@@ -534,11 +655,13 @@ void UndefinedMemoryBehavior::runOnOperation() {
         Value isOutOfBounds =
             b.create<comb::ICmpOp>(comb::ICmpPredicate::uge, addr, depthValue);
 
+        // Check out of bounds write
         check_write_out_of_bounds(b, &isOutOfBounds, &constantTrue,
                                   &writeIsEnabled);
 
         b.setInsertionPointAfter(readWriteOp); // For correct MLIR ordering.
 
+        // Check out of bounds read
         check_read_out_of_bounds(b, symbolNamespace, readWriteOp,
                                  &currentResult, nullptr, &organizationOp,
                                  depth, &readIsEnabled, &isOutOfBounds);
@@ -558,6 +681,7 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // No write enable was used when instantiating the port. Assume enabled.
         if (!writeOpIsEnabled) {
+          // Create a new true port for every
           Value writeTrue = b.create<hw::ConstantOp>(i1, 1);
           writeOpIsEnabled = writeTrue;
         }
@@ -597,34 +721,37 @@ void UndefinedMemoryBehavior::runOnOperation() {
 
         // If they are the same address, we need to check if they are going to
         // collide
-        auto isSameAddress = b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
-                                                    readWriteOp.getAddress(),
-                                                    readWriteOp2.getAddress());
-        Value rw2IsEnabled = readWriteOp2.getEnable();
-        if (!rw2IsEnabled) { // Assume enabled if enable does not exist.
-          Value rwTrue = b.create<hw::ConstantOp>(i1, 1);
-          rw2IsEnabled = rwTrue;
-        }
+        // Value isSameAddress = b.create<comb::ICmpOp>(comb::ICmpPredicate::eq,
+        //                                              readWriteOp.getAddress(),
+        //                                              readWriteOp2.getAddress());
+        // Value rw2IsEnabled = readWriteOp2.getEnable();
+        // if (!rw2IsEnabled) { // Assume enabled if enable does not exist.
+        //   Value rwTrue = b.create<hw::ConstantOp>(i1, 1);
+        //   rw2IsEnabled = rwTrue;
+        // }
 
         // Check for a write-write conflict.
-        Value readWrite_WriteConflict_valid =
-            b.create<comb::AndOp>(rw2IsEnabled, readWriteOp2.getMode());
-        Value bothWritesEnabled = b.create<comb::AndOp>(
-            writeIsEnabled, readWrite_WriteConflict_valid);
-        Value isWriteCollision =
-            b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
-        writeCollisionList.push_back(isWriteCollision);
+        // Value readWrite_WriteConflict_valid =
+        //     b.create<comb::AndOp>(rw2IsEnabled, readWriteOp2.getMode());
 
+        // Functions
+
+        // Value bothWritesEnabled = b.create<comb::AndOp>(
+        //     writeIsEnabled, readWrite_WriteConflict_valid);
+        // Value isWriteCollision =
+        //     b.create<comb::AndOp>(isSameAddress, bothWritesEnabled);
+        // writeCollisionList.push_back(isWriteCollision);
+        check_rwOp_conflicts(b, readWriteOp, readWriteOp2, &writeCollisionList,
+                             &readCollisionList, &writeIsEnabled,
+                             &readIsEnabled);
         // Read-write collision
-        Value readAndWriteEnabled =
-            b.create<comb::AndOp>(readIsEnabled, readWrite_WriteConflict_valid);
-        Value isReadCollision =
-            b.create<comb::AndOp>(isSameAddress, readAndWriteEnabled);
+        // Value isReadCollision;
 
-        // Add this collision to the list of collisions for this read operation
-        readCollisionList.push_back(isReadCollision);
-        // Order the insertion of ports based on the order the ports
-        // are instantiated
+        //  // check_read_write_conflict(
+        //       b, readWriteOp, readWriteOp2, &readCollisionList,
+        //       &readIsEnabled, &readWrite_WriteConflict_valid,
+        //       &isReadCollision, &isSameAddress);
+
         if (lastOp->isBeforeInBlock(readWriteOp2)) {
           lastOp = readWriteOp2;
         }
